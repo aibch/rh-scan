@@ -18,6 +18,7 @@ import log_picks
 import onchain
 import scanner
 import scoring
+import filter_backtest as fb
 
 NOW = datetime(2026, 7, 12, tzinfo=timezone.utc)
 WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"   # canonical addresses
@@ -123,6 +124,86 @@ class TestSimulateTransfer(unittest.TestCase):
         self.assertIsNone(self._sim(None))
 
 
+class TestOnchainRefreshTiers(unittest.TestCase):
+    NOW_EPOCH = datetime(2026, 7, 22, 12, tzinfo=timezone.utc).timestamp()
+
+    def rec(self, age_hours, **kw):
+        checked = datetime.fromtimestamp(
+            self.NOW_EPOCH - age_hours * 3600, timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        values = {
+            "checked_at": checked, "transfer_version": 2,
+            "transfer_ok": True, "had_key": True,
+            "sim_incomplete": False,
+        }
+        values.update(kw)
+        return values
+
+    def tier(self, rec, top=False, active=False, has_key=True):
+        return onchain.refresh_tier(
+            rec, top, active, self.NOW_EPOCH, has_key)
+
+    def test_new_and_incomplete_results_are_immediate(self):
+        self.assertEqual(self.tier(None), "new")
+        self.assertEqual(self.tier(
+            self.rec(0.1, transfer_version=1)), "retry")
+        self.assertEqual(self.tier(
+            self.rec(0.1, transfer_ok=False)), "retry")
+        self.assertEqual(self.tier(
+            self.rec(0.1, transfer_ok=None, sim_incomplete=True)), "retry")
+        self.assertEqual(self.tier(
+            self.rec(0.1, transfer_ok=None, had_key=False), has_key=True),
+            "retry")
+
+    def test_top_active_and_longtail_freshness(self):
+        self.assertIsNone(self.tier(self.rec(0.5), top=True, active=True))
+        self.assertEqual(self.tier(self.rec(1), top=True, active=True),
+                         "top-hourly")
+        self.assertIsNone(self.tier(self.rec(20), active=True))
+        self.assertEqual(self.tier(self.rec(24), active=True), "active-daily")
+        self.assertIsNone(self.tier(self.rec(48)))
+        self.assertEqual(self.tier(self.rec(73)), "longtail-3d")
+
+    def test_no_key_does_not_hot_loop_an_unavailable_simulation(self):
+        rec = self.rec(1, transfer_ok=None, had_key=False)
+        self.assertIsNone(self.tier(rec, has_key=False))
+
+    def test_top_candidates_reserve_budget_ahead_of_backlog(self):
+        self.assertLess(
+            onchain.selection_priority("top-hourly", True),
+            onchain.selection_priority("new", False))
+        self.assertLess(
+            onchain.selection_priority("retry", False),
+            onchain.selection_priority("new", False))
+
+    def test_target_plan_prioritizes_top_then_new_and_skips_quote_address(self):
+        top, new, active = "0xtop", "0xnew", "0xactive"
+
+        class FakeCursor(list):
+            def fetchall(self):
+                return self
+
+        class FakeConn:
+            def execute(self, _query):
+                return FakeCursor([
+                    {"tok": new, "liq": 100_000},
+                    {"tok": active, "liq": 80_000},
+                    {"tok": top, "liq": 50_000},
+                    {"tok": WETH, "liq": 1_000_000},
+                ])
+
+        cache = {top: self.rec(1), active: self.rec(24)}
+        tiers = ({top}, {top, active}, {top: 0, active: 1})
+        with mock.patch.object(onchain, "candidate_tiers", return_value=tiers):
+            plan = onchain.target_plan(
+                FakeConn(), cache, 3, self.NOW_EPOCH, has_alchemy=True)
+        self.assertEqual(plan, [
+            (top, "top-hourly"),
+            (new, "new"),
+            (active, "active-daily"),
+        ])
+
+
 class TestRedact(unittest.TestCase):
     def test_strips_query_and_masks_path_key(self):
         out = onchain.redact("https://x.alchemy.com/v2/SECRET123?a=b")
@@ -186,6 +267,71 @@ class TestMedian(unittest.TestCase):
         self.assertEqual(scoring.median([3, 1]), 2)
         self.assertEqual(scoring.median([7]), 7)
         self.assertIsNone(scoring.median([]))
+
+
+class TestFilterBacktest(unittest.TestCase):
+    def entry(self, **kw):
+        values = {
+            "epoch": 0.0, "token": "0xt", "pool": "0xp",
+            "key": ("0xp", "base"), "score": 65.0,
+            "liquidity_usd": 50_000.0, "age_days": 1.0,
+            "verified": None, "top10_pct": None, "transfer_ok": None,
+        }
+        values.update(kw)
+        return fb.Entry(**values)
+
+    def rule(self, **kw):
+        values = {
+            "liquidity_floor": 10_000.0, "min_age_days": 0.0,
+            "score_threshold": 0.0, "require_verified": False,
+            "top10_max": None, "require_transfer_ok": False,
+        }
+        values.update(kw)
+        return fb.Rule(**values)
+
+    def test_strict_onchain_gates_reject_unknown(self):
+        entry = self.entry()
+        self.assertTrue(fb.passes_rule(entry, self.rule()))
+        self.assertFalse(fb.passes_rule(
+            entry, self.rule(require_verified=True)))
+        self.assertFalse(fb.passes_rule(
+            entry, self.rule(top10_max=30.0)))
+        self.assertFalse(fb.passes_rule(
+            entry, self.rule(require_transfer_ok=True)))
+
+    def test_first_qualifying_entry_per_token(self):
+        entries = [
+            self.entry(epoch=0, score=40, liquidity_usd=5_000),
+            self.entry(epoch=1, score=70, pool="0xbest", key=("0xbest", "base")),
+            self.entry(epoch=1, score=60, pool="0xother", key=("0xother", "base")),
+            self.entry(epoch=2, score=90, pool="0xlater", key=("0xlater", "base")),
+            self.entry(epoch=1, token="0xu", pool="0xu", key=("0xu", "base")),
+        ]
+        selected = fb.first_qualifying_entries(entries, self.rule())
+        self.assertEqual([e.token for e in selected], ["0xt", "0xu"])
+        self.assertEqual(selected[0].pool, "0xbest")
+
+    def test_censored_outcomes_produce_strict_rug_bounds(self):
+        day = 86400.0
+        entries = [
+            self.entry(token="0xr", pool="0xr", key=("0xr", "base")),
+            self.entry(token="0xc", pool="0xc", key=("0xc", "base")),
+            self.entry(epoch=1.5 * day, token="0xp", pool="0xp",
+                       key=("0xp", "base")),
+        ]
+        prices = {
+            ("0xr", "base"): [(0, 1.0, 10_000), (day, 0.05, 10_000)],
+            ("0xc", "base"): [(0, 1.0, 10_000)],
+            ("0xp", "base"): [(1.5 * day, 1.0, 10_000)],
+        }
+        result = fb.evaluate_entries(entries, prices, 2 * day, 1)
+        self.assertEqual(result["measured"], 1)
+        self.assertEqual(result["censored"], 1)
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(result["rugs"], 1)
+        self.assertEqual(result["rug_rate_lower"], 0.5)
+        self.assertEqual(result["rug_rate_upper"], 1.0)
+        self.assertAlmostEqual(result["return_median"], -95.0)
 
 
 class TestRepollRetirement(unittest.TestCase):

@@ -7,8 +7,11 @@ Per token:
   - transfer simulation: can a real top holder actually move tokens?
     (eth_call with a spoofed `from` — catches blacklist/pause honeypots)
 
-Results are cached in data/onchain.json (recheck every RECHECK_DAYS) and
-upserted into the token_onchain table for scoring/reporting.
+Results are cached in data/onchain.json and refreshed in tiers within the
+per-run cap: due current top candidates first (so they cannot be starved), then
+retryable/new tokens, other recently active candidates daily, and the long tail
+every RECHECK_DAYS. Results are upserted into the token_onchain table for
+scoring/reporting.
 
 The transfer check needs ALCHEMY_API_KEY in the environment; without it the
 check is skipped and stored as null. Blockscout needs no key.
@@ -26,14 +29,24 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
 
 import db
+import scoring
 
 BLOCKSCOUT = "https://robinhoodchain.blockscout.com/api/v2"
 ALCHEMY_URL = "https://robinhood-mainnet.g.alchemy.com/v2/{key}"
 CACHE_PATH = os.path.join(db.DATA_DIR, "onchain.json")
 RECHECK_DAYS = 3
+# Scheduling thresholds leave room for hourly/daily workflow jitter without
+# letting the best-effort fallback trigger duplicate checks minutes later.
+# Ten matches log_picks.TOP_N and keeps the tiered steady-state demand below
+# the hard 40 checks/hour budget.
+TOP_CANDIDATES = 10
+TOP_RECHECK_HOURS = 0.75
+ACTIVE_RECHECK_HOURS = 23
+ACTIVE_LOOKBACK_HOURS = 24
 # keyed access allows 5 req/s (100k per 16h); anonymous access IP-blocks
 # quickly, so pace politely without a key
 REQUEST_GAP_S = 0.3 if os.environ.get("BLOCKSCOUT_API_KEY", "").strip() else 1.2
@@ -263,53 +276,131 @@ def upsert_db(conn, cache):
     conn.commit()
 
 
-QUOTE_LIKE = {"WETH", "USDG", "USDC", "USDT", "DAI", "WBTC"}
-ZERO = "0x0000000000000000000000000000000000000000"
+def candidate_tiers(conn, top_n=TOP_CANDIDATES):
+    """Return (top tokens, recently active tokens, candidate rank).
+
+    The top tier mirrors log_picks.py: only pools observed in the latest scan
+    can be current picks. The broader active tier accepts a pool whose latest
+    observation is no more than ACTIVE_LOOKBACK_HOURS behind that scan.
+    """
+    rows = list(db.latest_rows(conn))
+    if not rows:
+        return set(), set(), {}
+    scan_ts = max(r["ts"] for r in rows)
+    scan_epoch = scoring.parse_ts(scan_ts).timestamp()
+    now = scoring.parse_ts(scan_ts)
+    current = scoring.ranked_candidates(
+        [r for r in rows if r["ts"] == scan_ts], now)
+    recent = scoring.ranked_candidates(
+        [r for r in rows
+         if scoring.parse_ts(r["ts"]).timestamp()
+         >= scan_epoch - ACTIVE_LOOKBACK_HOURS * 3600], now)
+    top = {c["token"].lower() for c in current[:top_n]}
+    active = {c["token"].lower() for c in recent}
+    rank = {c["token"].lower(): i for i, c in enumerate(recent)}
+    return top, active, rank
 
 
-def targets(conn, cache, limit):
-    """Asset tokens worth checking, deepest liquidity first — from BOTH sides
-    of each pair (the asset is sometimes GeckoTerminal's quote token).
-    Skips wrapped/stable quote currencies and the native-ETH placeholder."""
+def needs_immediate_retry(rec, has_alchemy):
+    """Whether a cached result is untrusted or incomplete and should bypass
+    its normal freshness tier."""
+    return (
+        # pre-decode-fix results are untrusted in BOTH directions:
+        # old False could be a rate limit, old True an ABI false
+        (rec.get("transfer_version") or 0) < 2
+        # confirmed blocks re-verify promptly in case a token un-pauses
+        or rec.get("transfer_ok") == 0
+        # sim recorded without a key: backfill now that one exists
+        or (rec.get("transfer_ok") is None and not rec.get("had_key")
+            and has_alchemy)
+        # RPC failure during the sim: retry next run
+        or rec.get("sim_incomplete") is True
+    )
+
+
+def cache_age_seconds(rec, now_epoch):
+    try:
+        checked = datetime.strptime(rec["checked_at"], "%Y-%m-%dT%H:%M:%SZ")
+        return max(0, now_epoch - checked.replace(tzinfo=timezone.utc).timestamp())
+    except (KeyError, TypeError, ValueError):
+        return float("inf")
+
+
+def refresh_tier(rec, is_top, is_active, now_epoch, has_alchemy):
+    """Return the due tier for one token, or None while its cache is fresh."""
+    if rec is None:
+        return "new"
+    if needs_immediate_retry(rec, has_alchemy):
+        return "retry"
+    age = cache_age_seconds(rec, now_epoch)
+    if is_top and age >= TOP_RECHECK_HOURS * 3600:
+        return "top-hourly"
+    if is_active and age >= ACTIVE_RECHECK_HOURS * 3600:
+        return "active-daily"
+    if age >= RECHECK_DAYS * 86400:
+        return "longtail-3d"
+    return None
+
+
+TIER_ORDER = {
+    "retry": 0,
+    "new": 1,
+    "top-hourly": 2,
+    "active-daily": 3,
+    "longtail-3d": 4,
+}
+
+
+def selection_priority(tier, is_top):
+    """Top candidates reserve first claim on the fixed budget; remaining
+    capacity follows the normal freshness-tier order."""
+    return 0 if is_top else TIER_ORDER[tier] + 1
+
+
+def target_plan(conn, cache, limit, now_epoch=None, has_alchemy=None):
+    """Prioritized (token, tier) checks from both sides of every pair.
+
+    The cap remains the hard request-budget control. Ranking changes who gets
+    that budget, not how many checks the workflow performs.
+    """
     rows = conn.execute("""
-        SELECT tok, sym, MAX(liq) AS liq FROM (
-            SELECT p.base_token AS tok, t.symbol AS sym, s.liquidity_usd AS liq
-            FROM pools p LEFT JOIN tokens t ON t.address = p.base_token
+        SELECT tok, MAX(liq) AS liq FROM (
+            SELECT p.base_token AS tok, s.liquidity_usd AS liq
+            FROM pools p
             JOIN snapshots s ON s.id = (SELECT id FROM snapshots
                 WHERE pool_address = p.address ORDER BY ts DESC LIMIT 1)
             UNION ALL
-            SELECT p.quote_token, tq.symbol, s.liquidity_usd
-            FROM pools p LEFT JOIN tokens tq ON tq.address = p.quote_token
+            SELECT p.quote_token, s.liquidity_usd
+            FROM pools p
             JOIN snapshots s ON s.id = (SELECT id FROM snapshots
                 WHERE pool_address = p.address ORDER BY ts DESC LIMIT 1)
         ) GROUP BY tok HAVING liq >= 5000 ORDER BY liq DESC
     """).fetchall()
-    cutoff = datetime.now(timezone.utc).timestamp() - RECHECK_DAYS * 86400
+    if now_epoch is None:
+        now_epoch = datetime.now(timezone.utc).timestamp()
+    if has_alchemy is None:
+        has_alchemy = bool(os.environ.get("ALCHEMY_API_KEY", "").strip())
+    top, active, ranks = candidate_tiers(conn)
     due = []
     for r in rows:
-        if (r["sym"] or "").upper() in QUOTE_LIKE or r["tok"] == ZERO:
+        addr = (r["tok"] or "").lower()
+        # Symbols are user-controlled (a fake USDG exists), so skip only the
+        # canonical quote addresses used by scoring.asset_side.
+        if not addr or addr in scoring.QUOTE_ADDRESSES:
             continue
-        rec = cache.get(r["tok"])
-        if rec:
-            checked = datetime.strptime(rec["checked_at"], "%Y-%m-%dT%H:%M:%SZ")
-            fresh = checked.replace(tzinfo=timezone.utc).timestamp() > cutoff
-            needs_reverify = (
-                # pre-decode-fix results are untrusted in BOTH directions:
-                # old False could be a rate limit, old True an ABI false
-                rec.get("transfer_version", 0) < 2
-                # confirmed blocks re-verify each window (tokens un-pause)
-                or rec.get("transfer_ok") is False
-                # sim recorded without a key: backfill now that one exists
-                or (rec.get("transfer_ok") is None and not rec.get("had_key")
-                    and bool(os.environ.get("ALCHEMY_API_KEY", "").strip()))
-                # RPC failure during the sim: retry next run
-                or rec.get("sim_incomplete") is True)
-            if fresh and not needs_reverify:
-                continue
-        due.append(r["tok"])
-        if len(due) >= limit:
-            break
-    return due
+        tier = refresh_tier(cache.get(addr), addr in top, addr in active,
+                            now_epoch, has_alchemy)
+        if tier is None:
+            continue
+        due.append((selection_priority(tier, addr in top), TIER_ORDER[tier],
+                    ranks.get(addr, 10**9), -(r["liq"] or 0), addr, tier))
+    due.sort()
+    return [(addr, tier) for _, _, _, _, addr, tier in due[:limit]]
+
+
+def targets(conn, cache, limit):
+    """Back-compatible token-only view of target_plan."""
+    return [addr for addr, _ in target_plan(conn, cache, limit)]
 
 
 def main():
@@ -317,6 +408,8 @@ def main():
     ap.add_argument("--max", type=int, default=30, help="max tokens per run")
     ap.add_argument("--token", help="check one specific token address")
     args = ap.parse_args()
+    if args.max < 1:
+        ap.error("--max must be positive")
 
     alchemy_key = os.environ.get("ALCHEMY_API_KEY", "").strip()
     if not alchemy_key:
@@ -330,9 +423,13 @@ def main():
     conn = db.connect()
     cache = load_cache()
     pool_addrs = {r[0] for r in conn.execute("SELECT address FROM pools")}
-    todo = [args.token.lower()] if args.token else targets(conn, cache, args.max)
-    print(f"checking {len(todo)} tokens "
-          f"({len(cache)} cached, recheck window {RECHECK_DAYS}d)")
+    plan = ([(args.token.lower(), "manual")] if args.token
+            else target_plan(conn, cache, args.max))
+    todo = [addr for addr, _ in plan]
+    tier_counts = ", ".join(
+        f"{tier}={count}" for tier, count in Counter(t for _, t in plan).items())
+    print(f"checking {len(todo)} tokens ({len(cache)} cached; "
+          f"{tier_counts or 'nothing due'})")
 
     # tokens are checked concurrently (the Pacer keeps the aggregate
     # Blockscout rate unchanged); results are written back here in the main

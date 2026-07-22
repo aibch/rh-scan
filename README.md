@@ -51,6 +51,14 @@ under **repo Settings → Secrets and variables → Actions → New repository
 secret** named `ALCHEMY_API_KEY`. Locally: `ALCHEMY_API_KEY=... python3
 onchain.py`. Without it, that one check is skipped gracefully.
 
+The hourly workflow keeps a hard 40-token request budget but spends it by
+freshness priority. Any due current top-10 candidates take first claim so they
+cannot be starved; remaining capacity goes to failed and new checks, other
+recently active candidates daily, and the liquid-token long tail every three
+days. This keeps the data affecting picks fresh without attempting an
+API-heavy full-universe refresh. Every successful check still appends to
+`data/onchain_history.jsonl`, preserving look-ahead-safe historical validation.
+
 Blockscout 503-blocks anonymous requests from GitHub Actions runner IPs. To
 let the explorer checks run in CI, create a free account at
 [robinhoodchain.blockscout.com](https://robinhoodchain.blockscout.com), generate
@@ -82,6 +90,21 @@ rug rate, and untracked share per score band at 1/3/7-day horizons, the
 score→return rank correlation, and per-component post-mortems of the biggest
 score collapses. If the correlation isn't consistently positive, re-weight the
 model, bump `SCORE_VERSION`, and re-validate on a fresh period.
+
+## Backtesting Stage 2 filter rules (`filter_backtest.py`)
+
+`python3 filter_backtest.py` grid-searches liquidity floors, minimum pool age,
+score thresholds, verification, top-10 concentration, and confirmed-transfer
+gates. Each asset is entered once per rule at its first qualifying snapshot.
+Historical on-chain checks are joined as of that snapshot, and outcomes reuse
+the validator's fixed horizon windows and absorbing-rug rule. The console shows
+the strongest distinct cohorts; `--csv data/filter_backtest.csv` writes every
+rule/horizon result, including return percentiles and strict rug-rate bounds for
+censored pools.
+
+The grid is exploratory and tests many rules. Freeze a small set before judging
+it on fresh data; later, use `--entry-from YYYY-MM-DD` to start that prospective
+cohort without rewriting the original search period.
 
 ## Deployment
 
@@ -135,6 +158,7 @@ systemd writes SQLite).
 - `scanner.py` — Stage 1 scanner (`--once` or `--loop SECONDS`; `--jsonl` for append-only logs)
 - `report.py` — Stage 2 report: baseline rug rate, survivor vs rug launch profiles, current movers
 - `report_html.py` — generates `report.html`, a self-contained visual dashboard (auto-refreshed by the workflow every scan; pull and open in a browser)
+- `filter_backtest.py` — Stage 2 look-ahead-safe entry-filter grid search
 - `build_db.py` — rebuild `data/scanner.db` from `data/snapshots/*.jsonl`
 - `db.py` — shared SQLite schema (`data/scanner.db`)
 - `.github/workflows/scan.yml` — scheduled scanning on GitHub Actions
@@ -143,4 +167,7 @@ systemd writes SQLite).
 
 ## Following the plan
 
-You are now in **Stage 1**: let the scanner run unattended for 7 straight days. Don't trade anything. Then run `report.py` weekly through Stage 2 until you have 3+ weeks of data over 200+ tokens and a written set of filter rules — or the data tells you the edge doesn't exist, which is also a win.
+You are now in **Stage 2**: keep collecting until there are at least 3 weeks of
+data, run `report.py` for the rug-rate baseline, and use `filter_backtest.py` to
+write down a small set of candidate rules. Do not trade yet; prospective
+validation comes before Stage 3.

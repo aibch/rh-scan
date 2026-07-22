@@ -1,0 +1,45 @@
+name: pack-data
+
+# One-time bootstrap (and repair tool) for the encrypted public deployment:
+# encrypts the current plaintext data tree into dataenc/ and commits it, so
+# the export script has ciphertext to ship. Run manually from the Actions
+# tab; needs the DASHBOARD_PASSWORD secret on THIS repo.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scan   # shares the scan group so it never races a scan commit
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Encrypt data tree
+        env:
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+        run: |
+          if [ -z "$DASHBOARD_PASSWORD" ]; then
+            echo "::error::add the DASHBOARD_PASSWORD secret to this repo first"
+            exit 1
+          fi
+          pip install -q cryptography
+          python3 crypt_data.py pack
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dataenc
+          if git diff --cached --quiet; then
+            echo "dataenc/ already up to date"
+            exit 0
+          fi
+          git commit -m "pack: encrypt data tree for public deployment"
+          git push

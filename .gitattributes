@@ -1,0 +1,4 @@
+# append-only logs: concurrent appends merge cleanly by concatenation
+data/snapshots/*.jsonl merge=union
+data/picks/*.jsonl merge=union
+data/onchain_history.jsonl merge=union

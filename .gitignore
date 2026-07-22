@@ -1,0 +1,7 @@
+data/*
+!data/snapshots/
+!data/picks/
+!data/onchain.json
+!data/onchain_history.jsonl
+__pycache__/
+*.pyc

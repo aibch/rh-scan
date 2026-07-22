@@ -1,0 +1,136 @@
+name: scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Best-effort fallback only: GitHub fires this rarely-to-never for
+    # this repo (young account + best-effort scheduler), even after fixing
+    # authorship and stopping history rewrites. The RELIABLE hourly
+    # trigger is an external scheduler (cron-job.org) POSTing to the
+    # workflow_dispatch API at :07. Off-peak minute chosen deliberately;
+    # if both fire, the concurrency group serializes them.
+    - cron: "23 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scan
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # a queued run is pinned to the ref from when it was TRIGGERED; another
+      # run may have pushed since. Start from the actual branch tip.
+      - name: Sync to branch tip
+        run: |
+          git fetch origin ${{ github.ref_name }}
+          git reset --hard origin/${{ github.ref_name }}
+
+      # the public deployment (marked by .public from the export script)
+      # commits the data tree only as AES blobs — decrypt before scanning
+      - name: Unpack encrypted data
+        env:
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+        run: |
+          if [ -f .public ]; then
+            if [ -z "$DASHBOARD_PASSWORD" ]; then
+              echo "::error::the public deployment requires the DASHBOARD_PASSWORD secret"
+              exit 1
+            fi
+            pip install -q cryptography
+            if [ -d dataenc ]; then
+              python3 crypt_data.py unpack
+            fi
+          fi
+
+      - name: Scan Robinhood Chain pools
+        timeout-minutes: 12
+        continue-on-error: true
+        run: |
+          python3 scanner.py --once --jsonl | tee scan.log
+          if grep -q "PARTIAL" scan.log; then
+            echo "::warning::$(grep PARTIAL scan.log | tail -1)"
+          fi
+          rm -f scan.log
+
+      # completed days are immutable — gzip them (~85% smaller) to keep the
+      # repository's growth manageable; all readers handle .jsonl.gz
+      - name: Compress completed snapshot logs
+        run: |
+          today=$(date -u +%F)
+          for f in data/snapshots/*.jsonl; do
+            [ -e "$f" ] || continue
+            [ "$(basename "$f" .jsonl)" = "$today" ] && continue
+            gzip -9 "$f"
+          done
+
+      - name: On-chain safety checks
+        timeout-minutes: 7
+        continue-on-error: true
+        env:
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+          BLOCKSCOUT_API_KEY: ${{ secrets.BLOCKSCOUT_API_KEY }}
+        run: |
+          python3 build_db.py
+          python3 onchain.py --max 40
+
+      - name: Log picks and regenerate HTML dashboard
+        run: |
+          python3 log_picks.py
+          python3 report_html.py
+
+      # with a DASHBOARD_PASSWORD secret set, the dashboard is committed only
+      # as an AES-encrypted page for GitHub Pages (docs/index.html) and the
+      # plaintext report.html is untracked — for use with a PUBLIC repository
+      - name: Encrypt dashboard for GitHub Pages
+        env:
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+        run: |
+          if [ -n "$DASHBOARD_PASSWORD" ]; then
+            pip install -q cryptography
+            python3 encrypt_report.py
+          fi
+
+      - name: Commit snapshot
+        env:
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$DASHBOARD_PASSWORD" ]; then
+            git rm --cached -q report.html 2>/dev/null || true
+            git add docs/index.html
+          else
+            git add report.html
+          fi
+          if [ -f .public ]; then
+            # public deployment: commit the data tree encrypted, never raw
+            python3 crypt_data.py pack
+            git rm -r --cached -q data 2>/dev/null || true
+            git add dataenc
+          else
+            git add data/snapshots data/picks data/onchain.json data/onchain_history.jsonl
+          fi
+          if git diff --cached --quiet; then
+            echo "nothing new to commit"
+            exit 0
+          fi
+          git commit -m "scan: $(date -u +'%Y-%m-%dT%H:%MZ')"
+          # another push may have landed meanwhile — rebase (JSONL files
+          # union-merge via .gitattributes) and retry; if the rebase still
+          # conflicts (regenerated report), drop this cycle rather than fail
+          for i in 1 2 3; do
+            git push && exit 0
+            git fetch origin ${{ github.ref_name }}
+            git rebase origin/${{ github.ref_name }} || {
+              git rebase --abort
+              echo "::warning::unresolvable push race — this scan cycle's data was dropped"
+              exit 0
+            }
+          done
+          exit 1

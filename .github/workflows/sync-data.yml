@@ -1,0 +1,77 @@
+name: sync-data
+
+# PRIVATE-repo companion to the encrypted public deployment: once a day,
+# fetch the public repo's encrypted data tree, decrypt it with the shared
+# DASHBOARD_PASSWORD secret, and commit the plaintext here — keeping this
+# private repo the readable superset of everything the public CI collects.
+# On the public copy itself (marked by .public) this workflow is a no-op.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scan   # never race a scan commit on this repo
+
+env:
+  PUBLIC_REPO: aibch/rh-scan
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync to branch tip
+        run: |
+          git fetch origin ${{ github.ref_name }}
+          git reset --hard origin/${{ github.ref_name }}
+
+      - name: Pull and decrypt public data
+        env:
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+        run: |
+          if [ -f .public ]; then
+            echo "this IS the public deployment — nothing to sync"
+            exit 0
+          fi
+          if [ -z "$DASHBOARD_PASSWORD" ]; then
+            echo "::error::add the DASHBOARD_PASSWORD secret to this repo first"
+            exit 1
+          fi
+          curl -sSL --retry 3 \
+            "https://github.com/$PUBLIC_REPO/archive/refs/heads/main.tar.gz" \
+            -o /tmp/pub.tgz
+          mkdir -p /tmp/pub
+          tar -xzf /tmp/pub.tgz -C /tmp/pub --strip-components=1
+          if [ ! -d /tmp/pub/dataenc ]; then
+            echo "public repo has no dataenc/ yet — nothing to sync"
+            exit 0
+          fi
+          rm -rf dataenc
+          cp -r /tmp/pub/dataenc dataenc
+          if [ -f /tmp/pub/docs/index.html ]; then
+            mkdir -p docs
+            cp /tmp/pub/docs/index.html docs/index.html
+          fi
+          pip install -q cryptography
+          python3 crypt_data.py unpack
+
+      - name: Commit
+        run: |
+          [ -f .public ] && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data dataenc
+          git add docs/index.html 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "nothing new to sync"
+            exit 0
+          fi
+          git commit -m "sync: data from public deployment $(date -u +'%Y-%m-%dT%H:%MZ')"
+          git push

@@ -1,0 +1,33 @@
+# systemd unit for running the scanner on an always-on Linux box (VPS, Pi, ...)
+#
+#   sudo useradd --system --create-home --shell /usr/sbin/nologin robinhood
+#   sudo git clone <YOUR-REPO-URL> /opt/RobinhoodTracker
+#   sudo chown -R robinhood:robinhood /opt/RobinhoodTracker
+#   sudo cp /opt/RobinhoodTracker/deploy/robinhood-scanner.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now robinhood-scanner
+#
+#   journalctl -u robinhood-scanner -f     # tail the logs
+#   sudo -u robinhood python3 /opt/RobinhoodTracker/report.py
+
+[Unit]
+Description=Robinhood Chain token scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# never run as root — the scanner only needs to write its own data directory
+User=robinhood
+Group=robinhood
+WorkingDirectory=/opt/RobinhoodTracker
+ExecStart=/usr/bin/python3 scanner.py --loop 300
+Restart=always
+RestartSec=30
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/RobinhoodTracker/data
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

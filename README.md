@@ -67,6 +67,11 @@ scanner (normally refreshed hourly), not a streaming or executable quote. If
 an open token has no scanner price at or after entry, total portfolio P&L and
 return remain unavailable rather than treating it as break-even.
 
+The generated page has two top-level views: **Market scanner** for the original
+chain and pool research, and **Paper trades** for both the manual ledger and the
+separately labelled automatic Top-10 strategy. The tabs support keyboard
+navigation and preserve direct links to the paper sections.
+
 Results are gross of gas, fees, and slippage. For pessimistic Stage 3
 simulation, enter the fill price after your assumed slippage and account for
 gas separately in the note until explicit cost fields are added. Building the

@@ -62,6 +62,28 @@ body {
 .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 20px 56px; }
 header h1 { font-size: 22px; font-weight: 650; margin: 0 0 4px; }
 header .meta { color: var(--ink-2); font-size: 13.5px; }
+.dashboard-tabs {
+  display: none; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px;
+  margin: 24px 0 20px; padding: 4px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 10px;
+}
+.tabs-ready .dashboard-tabs { display: grid; }
+.dashboard-tab {
+  min-height: 44px; padding: 9px 14px; border: 1px solid transparent;
+  border-radius: 7px; background: transparent; color: var(--ink-2);
+  font: inherit; font-weight: 620; cursor: pointer;
+}
+.dashboard-tab:hover { background: var(--page); color: var(--ink); }
+.dashboard-tab[aria-selected="true"] {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+  box-shadow: inset 0 -2px 0 rgba(0,0,0,0.18);
+}
+.dashboard-tab:focus-visible, .dashboard-panel:focus-visible {
+  outline: 3px solid var(--accent); outline-offset: 2px;
+}
+.dashboard-panel { min-width: 0; }
+.dashboard-panel > .kpis:first-child { margin-top: 0; }
+.tabs-ready .dashboard-panel[hidden] { display: none; }
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
         gap: 12px; margin: 24px 0; }
 .tile { background: var(--surface); border: 1px solid var(--border);
@@ -161,6 +183,10 @@ footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
 @media (max-width: 860px) {
   .auto-charts { grid-template-columns: 1fr; }
 }
+@media print {
+  .dashboard-tabs { display: none !important; }
+  .dashboard-panel[hidden] { display: block !important; }
+}
 """
 
 JS = """
@@ -179,6 +205,117 @@ JS = """
   }
   document.addEventListener('mousemove', show);
   document.addEventListener('mouseleave', function () { tip.style.display = 'none'; });
+})();
+(function () {
+  var root = document.querySelector('.wrap');
+  var tablist = root && root.querySelector('[data-dashboard-tabs]');
+  if (!root || !tablist) return;
+
+  var tabs = Array.prototype.slice.call(
+    tablist.querySelectorAll('[role="tab"]')
+  );
+  var panels = tabs.map(function (tab) {
+    return document.getElementById(tab.getAttribute('aria-controls'));
+  });
+  if (tabs.length !== 2 || panels.some(function (panel) { return !panel; })) return;
+
+  function tabForHash() {
+    var id;
+    try {
+      id = decodeURIComponent(window.location.hash.slice(1));
+    } catch (_) {
+      return null;
+    }
+    if (!id) return null;
+    if (id === 'scanner-tab') return tabs[0];
+    if (id === 'paper-tab') return tabs[1];
+    var target = document.getElementById(id);
+    if (!target) return null;
+    var panel = target.closest('[role="tabpanel"]');
+    if (!panel) return null;
+    return tabs.find(function (tab) {
+      return tab.getAttribute('aria-controls') === panel.id;
+    }) || null;
+  }
+
+  function replaceHash(panel) {
+    if (!window.history || !window.history.replaceState) return;
+    try {
+      window.history.replaceState(null, '', '#' + panel.id);
+    } catch (_) {
+      // The report remains fully usable when history mutation is unavailable.
+    }
+  }
+
+  function activate(tab, focus, updateHash) {
+    var activePanel = null;
+    tabs.forEach(function (item, index) {
+      var selected = item === tab;
+      item.setAttribute('aria-selected', selected ? 'true' : 'false');
+      item.tabIndex = selected ? 0 : -1;
+      panels[index].hidden = !selected;
+      if (selected) activePanel = panels[index];
+    });
+    if (focus) tab.focus();
+    if (updateHash && activePanel) replaceHash(activePanel);
+  }
+
+  tabs.forEach(function (tab, index) {
+    tab.addEventListener('click', function () {
+      activate(tab, false, true);
+    });
+    tab.addEventListener('keydown', function (event) {
+      var next = null;
+      if (event.key === 'ArrowRight') next = tabs[(index + 1) % tabs.length];
+      if (event.key === 'ArrowLeft') {
+        next = tabs[(index - 1 + tabs.length) % tabs.length];
+      }
+      if (event.key === 'Home') next = tabs[0];
+      if (event.key === 'End') next = tabs[tabs.length - 1];
+      if (!next) return;
+      event.preventDefault();
+      activate(next, true, true);
+    });
+  });
+
+  window.addEventListener('hashchange', function () {
+    var hashTab = tabForHash();
+    if (!hashTab) return;
+    activate(hashTab, false, false);
+    var id;
+    try {
+      id = decodeURIComponent(window.location.hash.slice(1));
+    } catch (_) {
+      return;
+    }
+    var target = document.getElementById(id);
+    if (target && target.getAttribute('role') !== 'tabpanel') {
+      window.requestAnimationFrame(function () { target.scrollIntoView(); });
+    }
+  });
+
+  var initialTab = tabForHash()
+    || tabs.find(function (tab) {
+      return tab.getAttribute('aria-selected') === 'true';
+    })
+    || tabs[0];
+  activate(initialTab, false, false);
+  root.classList.add('tabs-ready');
+  tablist.hidden = false;
+
+  if (window.location.hash && tabForHash()) {
+    var initialTarget;
+    try {
+      initialTarget = document.getElementById(
+        decodeURIComponent(window.location.hash.slice(1))
+      );
+    } catch (_) {
+      initialTarget = null;
+    }
+    if (initialTarget && initialTarget.getAttribute('role') !== 'tabpanel') {
+      window.requestAnimationFrame(function () { initialTarget.scrollIntoView(); });
+    }
+  }
 })();
 """
 
@@ -1851,24 +1988,41 @@ def build(
     <div class="meta">Last scan {esc(last_ts)} · collecting since {esc(first_ts)} ·
       {n_scans} scans · data: GeckoTerminal, hourly via GitHub Actions</div>
   </header>
-  <div class="kpis">{kpis}</div>
-  {paper_section(portfolio)}
-  {auto_strategy_section(automatic_strategy)}
-  {pulse_section(conn)}
-  {collection_section(conn)}
-  {picks_section(latest, now)}
-  {rug_section(conn, latest, now)}
-  <div class="cols">
-    <div class="card"><h2>Top pools by 24h volume</h2>
-      <p class="sub">Pools with ≥ $1k liquidity · hover for detail</p>{bar_chart(latest)}</div>
-    <div class="card"><h2>Liquidity vs 24h volume</h2>
-      <p class="sub">Each dot is a pool, log scales · pools far above the diagonal
-        churn hard relative to their depth</p>{scatter(latest)}</div>
+  <div class="dashboard-tabs" role="tablist" aria-label="Dashboard views"
+       data-dashboard-tabs hidden>
+    <button class="dashboard-tab" id="scanner-tab" type="button" role="tab"
+            aria-selected="true" aria-controls="scanner-panel" tabindex="0">
+      Market scanner
+    </button>
+    <button class="dashboard-tab" id="paper-tab" type="button" role="tab"
+            aria-selected="false" aria-controls="paper-panel" tabindex="-1">
+      Paper trades
+    </button>
   </div>
-  {surges_section(conn)}
-  <div class="card"><h2>Newest pools (created in the last 24h)</h2>
-    <p class="sub">{len(new24)} pools created · showing the latest {len(new24_sorted)}</p>
-    {table_html(new24_sorted, launch_cols)}</div>
+  <section class="dashboard-panel" id="scanner-panel" role="tabpanel"
+           aria-labelledby="scanner-tab" tabindex="0">
+    <div class="kpis">{kpis}</div>
+    {pulse_section(conn)}
+    {collection_section(conn)}
+    {picks_section(latest, now)}
+    {rug_section(conn, latest, now)}
+    <div class="cols">
+      <div class="card"><h2>Top pools by 24h volume</h2>
+        <p class="sub">Pools with ≥ $1k liquidity · hover for detail</p>{bar_chart(latest)}</div>
+      <div class="card"><h2>Liquidity vs 24h volume</h2>
+        <p class="sub">Each dot is a pool, log scales · pools far above the diagonal
+          churn hard relative to their depth</p>{scatter(latest)}</div>
+    </div>
+    {surges_section(conn)}
+    <div class="card"><h2>Newest pools (created in the last 24h)</h2>
+      <p class="sub">{len(new24)} pools created · showing the latest {len(new24_sorted)}</p>
+      {table_html(new24_sorted, launch_cols)}</div>
+  </section>
+  <section class="dashboard-panel" id="paper-panel" role="tabpanel"
+           aria-labelledby="paper-tab" tabindex="0">
+    {paper_section(portfolio)}
+    {auto_strategy_section(automatic_strategy)}
+  </section>
   <footer>Generated {esc(now.strftime("%Y-%m-%dT%H:%M:%SZ"))} · report_html.py ·
     Stage 2 research with paper-only tracking — no real trading</footer>
 </div>

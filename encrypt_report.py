@@ -5,9 +5,9 @@ prompt that derives the key in-browser (WebCrypto, PBKDF2-SHA256) and renders
 the decrypted dashboard. Safe to host on public GitHub Pages: without the
 password the payload is ciphertext.
 
-NOTE: this protects the RENDERED dashboard only. In a public repository the
-underlying data files remain readable — treat this as access control for the
-view, not secrecy for the research.
+The public deployment also encrypts its underlying tracked data separately via
+``crypt_data.py``. Keep both controls: this file protects the rendered page;
+the data pack prevents raw market and paper-trade records from being published.
 
 Usage:
     DASHBOARD_PASSWORD=... python3 encrypt_report.py [--in report.html]

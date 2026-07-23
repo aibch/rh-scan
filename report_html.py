@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import chain_pulse
 import db
+import paper_trades
 import report
 import scoring
 import surges
@@ -30,27 +31,27 @@ CSS = """
   --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e;
   --muted: #898781; --grid: #e1e0d9; --baseline: #c3c2b7;
   --border: rgba(11,11,11,0.10); --accent: #2a78d6; --accent-soft: #cde2fb;
-  --up: #006300; --down: #d03b3b;
+  --up: #006300; --down: #d03b3b; --paper-realized: #9a6b13;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7;
     --muted: #898781; --grid: #2c2c2a; --baseline: #383835;
     --border: rgba(255,255,255,0.10); --accent: #3987e5; --accent-soft: #104281;
-    --up: #0ca30c; --down: #e66767;
+    --up: #0ca30c; --down: #e66767; --paper-realized: #e1ad45;
   }
 }
 :root[data-theme="dark"] {
   --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7;
   --muted: #898781; --grid: #2c2c2a; --baseline: #383835;
   --border: rgba(255,255,255,0.10); --accent: #3987e5; --accent-soft: #104281;
-  --up: #0ca30c; --down: #e66767;
+  --up: #0ca30c; --down: #e66767; --paper-realized: #e1ad45;
 }
 :root[data-theme="light"] {
   --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e;
   --muted: #898781; --grid: #e1e0d9; --baseline: #c3c2b7;
   --border: rgba(11,11,11,0.10); --accent: #2a78d6; --accent-soft: #cde2fb;
-  --up: #006300; --down: #d03b3b;
+  --up: #006300; --down: #d03b3b; --paper-realized: #9a6b13;
 }
 * { box-sizing: border-box; }
 body {
@@ -67,6 +68,8 @@ header .meta { color: var(--ink-2); font-size: 13.5px; }
 .tile .label { font-size: 12.5px; color: var(--ink-2); }
 .tile .value { font-size: 26px; font-weight: 600; margin-top: 2px; }
 .tile .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.paper-kpis { margin: 14px 0 18px; }
+.paper-kpis .value { font-size: 22px; }
 .card { background: var(--surface); border: 1px solid var(--border);
         border-radius: 8px; padding: 18px 20px; margin: 0 0 20px; }
 .card h2 { font-size: 15px; font-weight: 650; margin: 0 0 2px; }
@@ -106,6 +109,25 @@ td { border-bottom: 1px solid var(--grid); padding: 7px 10px 7px 0;
      font-variant-numeric: tabular-nums; white-space: nowrap; }
 th.num, td.num { text-align: right; }
 .up { color: var(--up); } .down { color: var(--down); }
+.paper-head { display: flex; justify-content: space-between; align-items: flex-start;
+              gap: 12px; }
+@media (max-width: 600px) {
+  .paper-head { flex-direction: column; }
+  .paper-head code { white-space: normal; }
+}
+.paper-head code, .empty-code { font: 12px/1.5 ui-monospace, SFMono-Regular,
+                               Consolas, monospace; background: var(--page);
+                               border: 1px solid var(--border); border-radius: 5px;
+                               padding: 4px 7px; white-space: nowrap; }
+.paper-legend { display: flex; flex-wrap: wrap; gap: 14px; color: var(--ink-2);
+                font-size: 12px; margin: 4px 0 10px; }
+.legend-line { display: inline-block; width: 22px; margin-right: 5px;
+               vertical-align: 3px; border-top: 2px solid var(--accent); }
+.legend-line.realized { border-color: var(--paper-realized); border-top-style: dashed; }
+.status { display: inline-block; border: 1px solid var(--border); border-radius: 10px;
+          padding: 1px 7px; font-size: 11.5px; color: var(--ink-2); }
+.status.open { border-color: var(--accent); color: var(--accent); }
+.token-sub { color: var(--muted); font-size: 11.5px; }
 .hoverable { cursor: default; }
 #tip { position: fixed; pointer-events: none; background: var(--surface);
        color: var(--ink); border: 1px solid var(--border); border-radius: 6px;
@@ -157,6 +179,53 @@ def fmt_pct(v):
     arrow = "▲" if v >= 0 else "▼"
     mag = f"{abs(v):,.0f}" if abs(v) >= 100 else f"{abs(v):.1f}"
     return f'<span class="{cls}">{arrow} {mag}%</span>'
+
+
+def fmt_signed_usd(v):
+    """Human-readable signed money; the sign is explicit without relying on colour."""
+    if v is None:
+        return "–"
+    sign = "+" if v > 0 else "−" if v < 0 else ""
+    return sign + fmt_usd(abs(v))
+
+
+def fmt_quantity(v):
+    if v is None:
+        return "–"
+    v = float(v)
+    if abs(v) >= 1_000_000:
+        return f"{v:,.0f}"
+    if abs(v) >= 1:
+        return f"{v:,.4f}".rstrip("0").rstrip(".")
+    return f"{v:.8f}".rstrip("0").rstrip(".")
+
+
+def fmt_token_price(v):
+    """Preserve tiny token prices that portfolio-dollar formatting rounds away."""
+    if v is None:
+        return "–"
+    v = float(v)
+    a = abs(v)
+    if a == 0:
+        return "$0"
+    if a >= 1:
+        text = f"{v:,.8f}"
+    elif a >= 1e-2:
+        text = f"{v:.10f}"
+    elif a >= 1e-6:
+        text = f"{v:.12f}"
+    elif a >= 1e-12:
+        text = f"{v:.16f}"
+    else:
+        return f"${v:.6e}"
+    return "$" + text.rstrip("0").rstrip(".")
+
+
+def pnl_html(v):
+    if v is None:
+        return '<span class="note">–</span>'
+    cls = "up" if v >= 0 else "down"
+    return f'<span class="{cls}">{esc(fmt_signed_usd(v))}</span>'
 
 
 def meter(frac):
@@ -518,9 +587,315 @@ def table_html(rows, cols):
             f'<tbody>{"".join(body)}</tbody></table></div>')
 
 
-def build(conn):
-    now = datetime.now(timezone.utc)
+def paper_pnl_chart(points):
+    """Portfolio P&L line with a zero baseline and explicit price coverage."""
+    points = [p for p in points if p.get("ts")]
+    valid_indexes = [i for i, p in enumerate(points) if p.get("pnl_usd") is not None]
+    if not valid_indexes:
+        return ('<p class="note">Portfolio P&amp;L is unavailable until every open '
+                'lot has a post-entry scanner price.</p>')
+
+    W, H, ml, mr, mt, mb = 920, 290, 68, 14, 12, 38
+    epochs = [_paper_ts(p["ts"]).timestamp() for p in points]
+    totals = [float(points[i]["pnl_usd"]) for i in valid_indexes]
+    realized = [float(p.get("realized_pnl_usd") or 0) for p in points]
+    raw_lo, raw_hi = min([0.0] + totals + realized), max([0.0] + totals + realized)
+    if raw_lo == raw_hi:
+        pad = max(1.0, abs(raw_hi) * 0.1)
+    else:
+        pad = (raw_hi - raw_lo) * 0.12
+    lo, hi = raw_lo - pad, raw_hi + pad
+    x0, x1 = min(epochs), max(epochs)
+
+    def sx(v):
+        if x0 == x1:
+            return (ml + W - mr) / 2
+        return ml + (v - x0) / (x1 - x0) * (W - ml - mr)
+
+    def sy(v):
+        return H - mb - (v - lo) / (hi - lo) * (H - mt - mb)
+
+    realized_pts = " ".join(
+        f"{sx(x):.1f},{sy(y):.1f}" for x, y in zip(epochs, realized))
+    zero_y = sy(0)
+    segments = []
+    current = []
+    for i, p in enumerate(points):
+        if p.get("pnl_usd") is None:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(i)
+    if current:
+        segments.append(current)
+    has_gaps = len(valid_indexes) != len(points)
+    parts = [
+        '<div class="paper-legend">'
+        '<span><i class="legend-line"></i>Total P&amp;L</span>'
+        '<span><i class="legend-line realized"></i>Realized P&amp;L</span>'
+        '<span>Unrealized = total − realized</span>'
+        + ('<span>Shaded gaps = incomplete price coverage</span>' if has_gaps else '')
+        + '</div>',
+        f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" '
+        f'aria-label="Paper portfolio profit and loss over time in US dollars">',
+    ]
+    for i in range(5):
+        val = lo + (hi - lo) * i / 4
+        y = sy(val)
+        parts.append(
+            f'<line x1="{ml}" y1="{y:.1f}" x2="{W-mr}" y2="{y:.1f}" '
+            f'stroke="var(--grid)" stroke-width="1"></line>'
+            f'<text x="{ml-7}" y="{y+4:.1f}" text-anchor="end" '
+            f'fill="var(--muted)">{esc(fmt_signed_usd(val))}</text>')
+    parts.append(
+        f'<line x1="{ml}" y1="{zero_y:.1f}" x2="{W-mr}" y2="{zero_y:.1f}" '
+        f'stroke="var(--baseline)" stroke-width="1.5"></line>'
+        f'<text x="{W-mr}" y="{zero_y-5:.1f}" text-anchor="end" '
+        f'fill="var(--muted)">$0 break-even</text>')
+
+    tick_count = min(6, len(points))
+    tick_indexes = sorted(set(
+        round(i * (len(points) - 1) / max(1, tick_count - 1))
+        for i in range(tick_count)))
+    short_span = (x1 - x0) < 2 * 86400
+    for i in tick_indexes:
+        dt = _paper_ts(points[i]["ts"])
+        label = dt.strftime("%b %d %H:%M" if short_span else "%b %d")
+        parts.append(
+            f'<text x="{sx(epochs[i]):.1f}" y="{H-12}" text-anchor="middle" '
+            f'fill="var(--muted)">{esc(label)}</text>')
+
+    # Visibly reserve incomplete intervals instead of connecting the total-P&L
+    # line across periods whose value is unknown.
+    i = 0
+    while i < len(points):
+        if points[i].get("pnl_usd") is not None:
+            i += 1
+            continue
+        start = i
+        while i + 1 < len(points) and points[i + 1].get("pnl_usd") is None:
+            i += 1
+        end = i
+        left = ((sx(epochs[start - 1]) + sx(epochs[start])) / 2
+                if start else sx(epochs[start]) - 3)
+        right = ((sx(epochs[end]) + sx(epochs[end + 1])) / 2
+                 if end + 1 < len(points) else sx(epochs[end]) + 3)
+        min_coverage = min(float(points[j].get("price_coverage_pct") or 0)
+                           for j in range(start, end + 1))
+        tipv = (f'{points[start]["ts"]} to {points[end]["ts"]}\n'
+                f'Portfolio P&L unavailable\nMinimum price coverage {min_coverage:.0f}%')
+        parts.append(
+            f'<rect x="{left:.1f}" y="{mt}" width="{max(right-left, 2):.1f}" '
+            f'height="{H-mt-mb}" fill="var(--baseline)" fill-opacity="0.18" '
+            f'class="hoverable" data-gap="true" tabindex="0" '
+            f'aria-label="{esc(tipv)}" data-tip="{esc(tipv)}"></rect>')
+        i += 1
+
+    for segment in segments:
+        total_pts = " ".join(
+            f'{sx(epochs[i]):.1f},{sy(float(points[i]["pnl_usd"])):.1f}'
+            for i in segment)
+        if len(segment) > 1:
+            area_pts = (f'{sx(epochs[segment[0]]):.1f},{zero_y:.1f} '
+                        f'{total_pts} '
+                        f'{sx(epochs[segment[-1]]):.1f},{zero_y:.1f}')
+            parts.append(
+                f'<polygon points="{area_pts}" fill="var(--accent)" '
+                f'fill-opacity="0.08"></polygon>')
+        parts.append(
+            f'<polyline class="paper-total-segment" points="{total_pts}" '
+            f'fill="none" stroke="var(--accent)" stroke-width="2.5" '
+            f'stroke-linejoin="round" stroke-linecap="round"></polyline>')
+
+    parts.append(
+        f'<polyline points="{realized_pts}" fill="none" '
+        f'stroke="var(--paper-realized)" stroke-width="1.8" '
+        f'stroke-dasharray="6 4" stroke-linejoin="round"></polyline>')
+    for i, p in enumerate(points):
+        if p.get("pnl_usd") is None:
+            continue
+        tipv = (f'{p["ts"]}\nTotal P&L {fmt_signed_usd(p["pnl_usd"])}\n'
+                f'Realized {fmt_signed_usd(p.get("realized_pnl_usd") or 0)}\n'
+                f'Unrealized {fmt_signed_usd(p.get("unrealized_pnl_usd") or 0)}\n'
+                f'Price coverage {float(p.get("price_coverage_pct") or 0):.0f}%')
+        stale = int(p.get("stale_lots") or 0)
+        unpriced = int(p.get("unpriced_lots") or 0)
+        if stale or unpriced:
+            tipv += f'\n{stale} stale · {unpriced} unpriced open lots'
+        parts.append(
+            f'<circle cx="{sx(epochs[i]):.1f}" '
+            f'cy="{sy(float(p["pnl_usd"])):.1f}" r="6" '
+            f'fill="var(--accent)" fill-opacity="0.01" class="hoverable" '
+            f'tabindex="0" aria-label="{esc(tipv)}" '
+            f'data-tip="{esc(tipv)}"></circle>')
+    last = valid_indexes[-1]
+    parts.append(
+        f'<circle cx="{sx(epochs[last]):.1f}" '
+        f'cy="{sy(float(points[last]["pnl_usd"])):.1f}" r="4" '
+        f'fill="var(--accent)" stroke="var(--surface)" stroke-width="2"></circle>'
+        f'<line x1="{ml}" y1="{H-mb}" x2="{W-mr}" y2="{H-mb}" '
+        f'stroke="var(--baseline)" stroke-width="1"></line></svg>')
+    return "".join(parts)
+
+
+def _compact_ts(value):
+    if not value:
+        return "–"
+    return str(value)[:16].replace("T", " ") + " UTC"
+
+
+def _paper_ts(value):
+    """Parse ledger timestamps, including fractional seconds and offsets."""
+    raw = str(value).strip()
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+    return datetime.fromisoformat(raw).astimezone(timezone.utc)
+
+
+def _delay_text(minutes):
+    minutes = float(minutes or 0)
+    if minutes < 60:
+        return f"{minutes:.0f}m"
+    if minutes < 48 * 60:
+        return f"{minutes / 60:.1f}h"
+    return f"{minutes / 1440:.1f}d"
+
+
+def paper_section(portfolio):
+    """Render the append-only paper ledger as a summary-first dashboard."""
+    summary = portfolio["summary"]
+    lots = portfolio["lots"]
+    if not summary.get("total_lots"):
+        return """
+  <section id="paper-tracker">
+    <div class="card">
+      <h2>Paper trade tracker</h2>
+      <p class="sub">Separate lots, latest recorded scanner marks, and portfolio P&amp;L over time</p>
+      <p class="note">No paper trades yet. From the private checkout, run:</p>
+      <p><code class="empty-code">python paper_trades.py add</code></p>
+      <p class="note">The command prompts for token address, entry price, UTC timestamp,
+        and USD amount. Each repeat buy becomes its own lot.</p>
+    </div>
+  </section>"""
+
+    def tile(label, value, sub="", value_class=""):
+        cls = f' {value_class}' if value_class else ""
+        return (f'<div class="tile"><div class="label">{esc(label)}</div>'
+                f'<div class="value{cls}">{value}</div>'
+                + (f'<div class="sub">{sub}</div>' if sub else "") + '</div>')
+
+    coverage = float(summary.get("price_coverage_pct") or 0)
+    total_pnl = summary.get("total_pnl_usd")
+    total_return = summary.get("total_return_pct")
+    pnl_cls = ("up" if total_pnl >= 0 else "down") if total_pnl is not None else ""
+    if total_return is not None:
+        total_sub = f'{fmt_pct(total_return)} of cumulative deployed'
+    elif not summary.get("total_deployed_usd"):
+        total_sub = "no deployed capital"
+    else:
+        total_sub = f'unavailable until price coverage reaches 100% (now {coverage:.0f}%)'
+    kpis = "".join([
+        tile("Cumulative deployed", esc(fmt_usd(summary.get("total_deployed_usd"))),
+             f'{summary.get("total_lots", 0)} recorded lots'),
+        tile("Open cost basis", esc(fmt_usd(summary.get("open_cost_basis_usd"))),
+             f'{summary.get("open_lots", 0)} open lots'),
+        tile("Open marked value", esc(fmt_usd(summary.get("open_market_value_usd"))),
+             f'{coverage:.0f}% of open cost priced'),
+        tile("Marked unrealized P&L", pnl_html(summary.get("unrealized_pnl_usd")),
+             "priced open lots only"),
+        tile("Realized P&L", pnl_html(summary.get("realized_pnl_usd")),
+             f'{summary.get("closed_lots", 0)} closed lots'),
+        tile("Total P&L", esc(fmt_signed_usd(total_pnl)),
+             total_sub, pnl_cls),
+    ])
+
+    status_order = {"open": 0, "closed": 1, "void": 2}
+    lots = sorted(lots, key=lambda lot: (
+        status_order.get(lot.get("status"), 9),
+        -_paper_ts(lot["entry_ts"]).timestamp()))
+    rows = []
+    for lot in lots:
+        token = lot.get("token") or "?"
+        symbol = lot.get("symbol") or (token[:8] + "…" if len(token) > 10 else token)
+        trade_id = lot.get("trade_id") or "?"
+        note = lot.get("note") or lot.get("close_note") or lot.get("void_reason")
+        tipv = (f'{token}\nLot {trade_id}\nRecorded {lot.get("recorded_at") or "?"}'
+                + (f'\n{note}' if note else ""))
+        status = lot.get("status") or "?"
+        if status == "closed":
+            mark = (f'{esc(fmt_token_price(lot.get("exit_price_usd")))}<br>'
+                    f'<span class="token-sub">exit '
+                    f'{esc(_compact_ts(lot.get("exit_ts")))}</span>')
+        elif status == "open" and lot.get("mark_price_usd") is not None:
+            pstatus = str(lot.get("price_status") or "recorded").replace("_", " ")
+            mark = (f'{esc(fmt_token_price(lot.get("mark_price_usd")))}<br>'
+                    f'<span class="token-sub">{esc(pstatus)} · '
+                    f'{esc(_compact_ts(lot.get("mark_ts")))}</span>')
+        elif status == "void":
+            mark = '<span class="note">excluded</span>'
+        else:
+            pstatus = str(lot.get("price_status") or "unpriced").replace("_", " ")
+            mark = f'<span class="note">{esc(pstatus)}</span>'
+        value = lot.get("value_usd")
+        return_pct = lot.get("return_pct")
+        entered = esc(_compact_ts(lot.get("entry_ts")))
+        if lot.get("backfilled"):
+            entered += (f'<br><span class="token-sub">backfilled +'
+                        f'{esc(_delay_text(lot.get("entry_delay_minutes")))} later</span>')
+        rows.append(
+            f'<tr><td class="hoverable" data-tip="{esc(tipv)}"><b>{esc(symbol)}</b><br>'
+            f'<span class="token-sub">{esc(trade_id)}</span></td>'
+            f'<td>{entered}</td>'
+            f'<td class="num">{esc(fmt_usd(lot.get("invested_usd")))}</td>'
+            f'<td class="num">{esc(fmt_token_price(lot.get("entry_price_usd")))}</td>'
+            f'<td class="num">{esc(fmt_quantity(lot.get("quantity")))}</td>'
+            f'<td class="num">{mark}</td>'
+            f'<td class="num">{esc(fmt_usd(value))}</td>'
+            f'<td class="num">{pnl_html(lot.get("pnl_usd"))}</td>'
+            f'<td class="num">{fmt_pct(return_pct)}</td>'
+            f'<td><span class="status {esc(status)}">{esc(status)}</span></td></tr>')
+
+    stale = int(summary.get("stale_open_lots") or 0)
+    unpriced = int(summary.get("unpriced_open_lots") or 0)
+    freshness = (f'{stale} stale and {unpriced} unpriced open lots' if stale or unpriced
+                 else 'all open capital has a recent recorded mark')
+    warning_html = "".join(
+        f'<p class="note">⚠ {esc(w)}</p>' for w in portfolio.get("warnings", []))
+    return f"""
+  <section id="paper-tracker">
+    <div class="card">
+      <div class="paper-head"><div><h2>Paper trade tracker</h2>
+        <p class="sub">Realized exits + unrealized latest scanner marks · as of
+          {esc(portfolio.get("as_of"))}</p></div>
+        <code>python paper_trades.py add</code></div>
+      <div class="kpis paper-kpis">{kpis}</div>
+      <h2>Paper P&amp;L over time</h2>
+      <p class="sub">Marked at the deepest-liquidity recorded token price per scan;
+        forward-filled between scans · hover points for coverage</p>
+      {paper_pnl_chart(portfolio.get("trend", []))}
+      <p class="note">Latest recorded prices are research marks, not executable live quotes ·
+        {esc(freshness)}.</p>
+      {warning_html}
+    </div>
+    <div class="card">
+      <h2>Paper lots</h2>
+      <p class="sub">Every entry is independent, including repeat buys of the same token ·
+        close one with <code>python paper_trades.py close LOT_ID</code></p>
+      <div class="tablewrap"><table><thead><tr>
+        <th>Token / lot</th><th>Entered / recorded</th><th class="num">Invested</th>
+        <th class="num">Entry price</th><th class="num">Quantity</th>
+        <th class="num">Latest mark / exit</th><th class="num">Value / proceeds</th>
+        <th class="num">P&amp;L</th><th class="num">Return</th><th>Status</th>
+      </tr></thead><tbody>{"".join(rows)}</tbody></table></div>
+    </div>
+  </section>"""
+
+
+def build(conn, ledger_path=paper_trades.LEDGER_PATH, now=None):
+    now = now or datetime.now(timezone.utc)
     latest = db.latest_rows(conn)
+    portfolio = paper_trades.build_portfolio(conn, ledger_path=ledger_path, now=now)
     n_tokens = conn.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]
     n_scans = conn.execute("SELECT COUNT(DISTINCT ts) FROM snapshots").fetchone()[0]
     first_ts, last_ts = conn.execute("SELECT MIN(ts), MAX(ts) FROM snapshots").fetchone()
@@ -564,6 +939,7 @@ def build(conn):
       {n_scans} scans · data: GeckoTerminal, hourly via GitHub Actions</div>
   </header>
   <div class="kpis">{kpis}</div>
+  {paper_section(portfolio)}
   {pulse_section(conn)}
   {collection_section(conn)}
   {picks_section(latest, now)}
@@ -580,7 +956,7 @@ def build(conn):
     <p class="sub">{len(new24)} pools created · showing the latest {len(new24_sorted)}</p>
     {table_html(new24_sorted, launch_cols)}</div>
   <footer>Generated {esc(now.strftime("%Y-%m-%dT%H:%M:%SZ"))} · report_html.py ·
-    stage 1 of docs/strategy-plan.md — data collection only, no trading</footer>
+    Stage 2 research with paper-only tracking — no real trading</footer>
 </div>
 <div id="tip"></div>
 <script>{JS}</script>
@@ -590,6 +966,8 @@ def build(conn):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="report.html")
+    ap.add_argument("--paper-ledger", default=str(paper_trades.LEDGER_PATH),
+                    help="paper-trade JSONL path (default: data/paper_trades.jsonl)")
     ap.add_argument("--fragment", action="store_true",
                     help="emit body content only (no <!doctype>/<html> wrapper)")
     args = ap.parse_args()
@@ -598,7 +976,7 @@ def main():
         raise SystemExit("no data/scanner.db — run scanner.py or build_db.py first")
     conn = db.connect()
     try:
-        inner = build(conn)
+        inner = build(conn, ledger_path=args.paper_ledger)
     finally:
         conn.close()
 
@@ -607,6 +985,7 @@ def main():
     else:
         doc = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
                '<meta name="viewport" content="width=device-width, initial-scale=1">'
+               '<link rel="icon" href="data:,">'
                f'</head><body>{inner}</body></html>')
     # atomic + explicit encoding: never truncate the old report before the
     # new one is fully written, and never depend on the platform default

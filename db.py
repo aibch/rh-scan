@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS pools (
     first_seen_at   TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_pools_base_token ON pools (base_token);
+CREATE INDEX IF NOT EXISTS idx_pools_quote_token ON pools (quote_token);
+
 CREATE TABLE IF NOT EXISTS snapshots (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     ts               TEXT NOT NULL,

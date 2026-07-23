@@ -44,6 +44,12 @@ jobs:
             echo "::error::add the DASHBOARD_PASSWORD secret to this repo first"
             exit 1
           fi
+          # Scanner data flows public -> private, but the manually entered
+          # paper ledger flows private -> public. Preserve it so a scheduled
+          # sync cannot roll back a trade that has not been exported yet.
+          if [ -f data/paper_trades.jsonl ]; then
+            cp data/paper_trades.jsonl /tmp/private-paper-trades.jsonl
+          fi
           curl -sSL --retry 3 \
             "https://github.com/$PUBLIC_REPO/archive/refs/heads/main.tar.gz" \
             -o /tmp/pub.tgz
@@ -61,6 +67,12 @@ jobs:
           fi
           pip install -q cryptography
           python3 crypt_data.py unpack
+          if [ -f /tmp/private-paper-trades.jsonl ]; then
+            cp /tmp/private-paper-trades.jsonl data/paper_trades.jsonl
+          fi
+          # The downloaded dataenc may contain an older public ledger. Repack
+          # after restoring the private source of truth so ciphertext matches.
+          python3 crypt_data.py pack
 
       - name: Commit
         run: |

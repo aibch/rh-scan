@@ -17,7 +17,9 @@ this leaks is WHETHER a file changed, which the commit history shows anyway.
 
 pack also prunes dataenc/ entries whose source file no longer exists (e.g.
 a day's .jsonl after it is gzipped), so unpack always recreates exactly the
-current data tree. unpack never deletes extra plaintext files.
+current data tree. unpack never deletes extra plaintext files. In a private
+checkout (no ``.public`` marker), unpack also refuses to overwrite an existing
+paper-trade ledger because that manually entered file is authoritative.
 """
 
 import argparse
@@ -28,9 +30,14 @@ import sys
 
 DATA_DIR = "data"
 ENC_DIR = "dataenc"
-# only the paths that are git-tracked in the private repo; local-only state
-# (scanner.db, spike_state.json, ...) stays out of the public tree entirely
-TRACKED = ["snapshots", "picks", "onchain.json", "onchain_history.jsonl"]
+# Only paths tracked in the private repo; local-only state (scanner.db,
+# spike_state.json, ...) stays out of the public tree entirely.  The paper
+# ledger is manually authored and private-authoritative: sync-data preserves
+# the private copy before unpacking deployment ciphertext.
+TRACKED = [
+    "snapshots", "picks", "onchain.json", "onchain_history.jsonl",
+    "paper_trades.jsonl",
+]
 
 MAGIC = b"RHENC1\n"
 # fixed salt keeps the derived key — and therefore the ciphertext of
@@ -104,15 +111,22 @@ def pack(key):
 
 def unpack(key):
     count = 0
+    preserved = 0
     for enc in iter_files(ENC_DIR):
         if not enc.endswith(".enc"):
             continue
         rel = os.path.relpath(enc, ENC_DIR)[:-len(".enc")]
+        out = os.path.join(DATA_DIR, rel)
+        if (rel == "paper_trades.jsonl" and os.path.exists(out)
+                and not os.path.exists(".public")):
+            preserved += 1
+            continue
         with open(enc, "rb") as f:
             plaintext = decrypt_bytes(key, f.read())
-        write_atomic(os.path.join(DATA_DIR, rel), plaintext)
+        write_atomic(out, plaintext)
         count += 1
-    print(f"unpack: {count} files -> {DATA_DIR}/")
+    suffix = f" ({preserved} private file preserved)" if preserved else ""
+    print(f"unpack: {count} files -> {DATA_DIR}/{suffix}")
 
 
 def main():

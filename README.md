@@ -23,6 +23,56 @@ python3 report.py               # judges pools 7+ days old
 python3 report.py --age-days 1  # useful in the first week
 ```
 
+## Paper trade tracker
+
+Paper entries live in an append-only private ledger at
+`data/paper_trades.jsonl`. Each buy is a separate lot, so buying the same token
+on different days preserves each entry price, timestamp, quantity, and result.
+
+```bash
+# prompted entry (recommended)
+python3 paper_trades.py add
+
+# equivalent non-interactive entry
+python3 paper_trades.py add \
+  --token 0x0123456789abcdef0123456789abcdef01234567 \
+  --symbol TOKEN --price 0.0000125 --at 2026-07-22T18:30:00Z \
+  --usd 50 --note "candidate rule A"
+
+python3 paper_trades.py list
+
+# closes the entire selected lot; repeat buys remain separate
+python3 paper_trades.py close LOT_ID \
+  --price 0.0000152 --at 2026-07-24T09:00:00Z --note "take profit"
+
+# audit-preserving correction for an erroneous open entry
+python3 paper_trades.py void LOT_ID --reason "wrong token address"
+
+# rebuild the visual dashboard
+python3 build_db.py
+python3 report_html.py
+```
+
+Token addresses must be full 40-hex EVM addresses. Entry and exit timestamps
+must include `Z` or an explicit timezone offset and cannot be in the future.
+`close` is full-lot only; use separate entry lots when you want independently
+managed position slices. The ledger separately records when the command was
+run; entries recorded more than 15 minutes after their claimed entry time are
+visibly flagged as backfilled to protect prospective paper-trading evidence.
+
+The dashboard shows cumulative deployed capital, open marked value, realized
+and unrealized P&L, a 6-hour portfolio P&L trend, price coverage/staleness, and
+one outcome row per lot. “Current” means the latest price recorded by this
+scanner (normally refreshed hourly), not a streaming or executable quote. If
+an open token has no scanner price at or after entry, total portfolio P&L and
+return remain unavailable rather than treating it as break-even.
+
+Results are gross of gas, fees, and slippage. For pessimistic Stage 3
+simulation, enter the fill price after your assumed slippage and account for
+gas separately in the note until explicit cost fields are added. Building the
+tracker early does not advance the project out of Stage 2 or authorize live
+trading.
+
 ## What the scanner captures (per pool, every cycle)
 
 - price (USD), liquidity (USD), FDV, market cap
@@ -130,9 +180,10 @@ resets). Making the repo public removes the minutes cap entirely.
 
 #### Going public with a password-gated dashboard
 
-Making the repo public removes the Actions minutes cap. To keep the rendered
-dashboard behind a password (note: the raw `data/` files stay world-readable
-in a public repo — this gates the view, not the research):
+Making the deployment twin public removes the Actions minutes cap. The public
+tree carries market data and the paper ledger only as AES-encrypted files under
+`dataenc/`; plaintext `data/` and `report.html` are excluded. The rendered
+dashboard is separately password-gated:
 
 1. Add a repository secret `DASHBOARD_PASSWORD`.
 2. Flip the repo to public (Settings → General → Danger Zone).
@@ -143,6 +194,19 @@ Each scan then commits only `docs/index.html` — an AES-256-GCM-encrypted page
 that prompts for the password and decrypts in the browser (WebCrypto, PBKDF2
 300k iterations). The plaintext `report.html` is no longer committed; generate
 it locally anytime with `python3 build_db.py && python3 report_html.py`.
+
+The paper ledger is private-authoritative. After adding or closing a trade:
+
+1. Commit and push `data/paper_trades.jsonl` to the private repository.
+2. Run the private repository's `pack-data` workflow (or run
+   `DASHBOARD_PASSWORD=... python3 crypt_data.py pack` locally), then pull its
+   ciphertext commit.
+3. Run the sanitized public-export script. Public Actions decrypt the ledger
+   only inside the job to render the dashboard and commit only its encrypted
+   mirror.
+
+Public history can reveal that the encrypted ledger changed and its approximate
+size, but not its token addresses, prices, timestamps, amounts, or notes.
 
 ### 2. systemd on an always-on box (best for the real 5-min cadence)
 
@@ -158,6 +222,7 @@ systemd writes SQLite).
 - `scanner.py` — Stage 1 scanner (`--once` or `--loop SECONDS`; `--jsonl` for append-only logs)
 - `report.py` — Stage 2 report: baseline rug rate, survivor vs rug launch profiles, current movers
 - `report_html.py` — generates `report.html`, a self-contained visual dashboard (auto-refreshed by the workflow every scan; pull and open in a browser)
+- `paper_trades.py` — append-only paper-lot entry/close/void CLI plus portfolio valuation and P&L trend engine
 - `filter_backtest.py` — Stage 2 look-ahead-safe entry-filter grid search
 - `build_db.py` — rebuild `data/scanner.db` from `data/snapshots/*.jsonl`
 - `db.py` — shared SQLite schema (`data/scanner.db`)
@@ -170,4 +235,6 @@ systemd writes SQLite).
 You are now in **Stage 2**: keep collecting until there are at least 3 weeks of
 data, run `report.py` for the rug-rate baseline, and use `filter_backtest.py` to
 write down a small set of candidate rules. Do not trade yet; prospective
-validation comes before Stage 3.
+validation comes before Stage 3. The paper tracker is available early for
+workflow testing, but the formal 30-trade Stage 3 cohort starts only after the
+Stage 2 exit criteria are frozen.

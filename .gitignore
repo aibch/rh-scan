@@ -3,5 +3,9 @@ data/*
 !data/picks/
 !data/onchain.json
 !data/onchain_history.jsonl
+!data/paper_trades.jsonl
 __pycache__/
 *.pyc
+.playwright-cli/
+output/playwright/
+report.html

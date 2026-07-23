@@ -387,6 +387,7 @@ class TestPortfolio(ValuationCase):
             self.conn,
             ledger_path=self.ledger,
             now=datetime(2026, 1, 1, 7, 0, 0, 123456, tzinfo=timezone.utc),
+            picks_dir=Path(self.temp.name) / "empty-picks",
         )
         self.assertIn("Paper P&amp;L over time", rendered)
         self.assertIn("pt-20260101T000000Z-00000001", rendered)

@@ -73,6 +73,60 @@ gas separately in the note until explicit cost fields are added. Building the
 tracker early does not advance the project out of Stage 2 or authorize live
 trading.
 
+### Automatic hourly Top 10 research cohort
+
+The automatic strategy is deliberately separate from manual paper trades. On
+each complete public hourly scan, the ten highest-ranked priceable assets create
+independent **$1 virtual signals**. Each signal fills at the first valid recorded
+pool-side price within two hours of ranking or expires as a missed fill. No
+automatic event is written to
+`data/paper_trades.jsonl`; the cohort is derived from the existing immutable,
+AES-encrypted `data/picks/` records.
+
+Each prospective signal is deterministic and idempotent, keyed by its scan,
+token, rank, and score version, so a workflow retry cannot create a duplicate.
+The record preserves the rank, total score, `score_version`, scan quote, and
+the later `logged_at` time when that ranking actually became available. Its
+official strategy stamp is created only by the public collector; a
+private/local scan cannot manufacture prospective entries. All stamped score
+versions remain in the combined live book after future model-version bumps.
+
+The strategy targets an exit at **+24h from the actual fill**. It uses the first
+recorded quote from that target through +6h; without one, the outcome is
+censored rather than silently carried forward. Returns at **+1h, +6h, +72h,
+and +168h** use their precommitted observation windows and remain diagnostics;
+the 72h and 168h marks do not extend exposure beyond the 24h target. Tooltips
+show the actual observation timestamp and delay. The dashboard keeps three
+populations distinct:
+
+- live prospective automatic signals, fills, and missed fills after activation;
+- a clearly labelled historical preview replayed from earlier immutable picks;
+- manually entered paper trades from the private ledger.
+
+At a full ten filled entries per hour, the strategy deploys $10 of research
+notional per hour. After the first 24 hours, the exit target produces an
+expected rolling open exposure of about **$240** (`10 × $1 × 24`), while
+cumulative deployed notional continues to grow by up to $240 per day. Fewer
+eligible picks, missing prices, or missed scans reduce those figures.
+
+The $1 unit is for comparable research returns, not cash and not a suggested
+position size. Results are gross: they do not model gas, fees, taxes, slippage,
+liquidity limits, failed execution, or sell restrictions. The earlier scan
+quote is provenance only. A prospective signal remains `awaiting_fill` until
+the first valid recorded price for the selected pool side in
+`[logged_at, logged_at + 2h]`; that observation supplies both entry price and
+liquidity, and the 24-hour clock starts at its timestamp. If no such quote
+arrives, the signal becomes a terminal `missed_fill` and is never deployed
+later. Candidates without a finite positive asset-side price are removed before
+prospective ranking/stamping.
+
+Every public run that reaches `log_picks.py` also appends an identity-free scan
+manifest recording whether the prospective cohort was accepted or gated
+(partial scan, missing scan metadata, or fewer than ten priceable candidates).
+The dashboard calls this **logged-attempt acceptance**: it does not include
+scheduler misses, failures before the pick-log step, or pushes that never land,
+which remain visible only in GitHub Actions/workflow monitoring.
+
 ## What the scanner captures (per pool, every cycle)
 
 - price (USD), liquidity (USD), FDV, market cap
@@ -205,6 +259,14 @@ The paper ledger is private-authoritative. After adding or closing a trade:
    only inside the job to render the dashboard and commit only its encrypted
    mirror.
 
+The automatic Top 10 cohort does not change that ownership flow. It derives
+signals and fills from the public collector's encrypted immutable `data/picks/`, stores
+no automatic trades in the manual ledger, and requires no private-to-public
+paper-ledger merge. Its strategy stamp contains no user-entered amount, note,
+wallet, or identity; the official prospective stamp is generated only on the
+public deployment. Automatic, historical-preview, and manual results remain
+separate in the password-gated report.
+
 Public history can reveal that the encrypted ledger changed and its approximate
 size, but not its token addresses, prices, timestamps, amounts, or notes.
 
@@ -223,6 +285,8 @@ systemd writes SQLite).
 - `report.py` — Stage 2 report: baseline rug rate, survivor vs rug launch profiles, current movers
 - `report_html.py` — generates `report.html`, a self-contained visual dashboard (auto-refreshed by the workflow every scan; pull and open in a browser)
 - `paper_trades.py` — append-only paper-lot entry/close/void CLI plus portfolio valuation and P&L trend engine
+- `auto_paper.py` — derives versioned live/historical automatic books, bounded fills, outcomes, summaries, and chart payloads
+- `log_picks.py` — immutable ranked picks plus public-only automatic strategy stamps and scan-acceptance manifests
 - `filter_backtest.py` — Stage 2 look-ahead-safe entry-filter grid search
 - `build_db.py` — rebuild `data/scanner.db` from `data/snapshots/*.jsonl`
 - `db.py` — shared SQLite schema (`data/scanner.db`)
@@ -236,5 +300,6 @@ You are now in **Stage 2**: keep collecting until there are at least 3 weeks of
 data, run `report.py` for the rug-rate baseline, and use `filter_backtest.py` to
 write down a small set of candidate rules. Do not trade yet; prospective
 validation comes before Stage 3. The paper tracker is available early for
-workflow testing, but the formal 30-trade Stage 3 cohort starts only after the
-Stage 2 exit criteria are frozen.
+workflow testing, and the automatic Top 10 cohort is an additional Stage 2
+research feed. Neither starts the formal 30-trade Stage 3 cohort, which begins
+only after the Stage 2 entry, exit, and risk rules are frozen.

@@ -15,6 +15,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 
+import auto_paper
 import chain_pulse
 import db
 import paper_trades
@@ -70,6 +71,8 @@ header .meta { color: var(--ink-2); font-size: 13.5px; }
 .tile .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
 .paper-kpis { margin: 14px 0 18px; }
 .paper-kpis .value { font-size: 22px; }
+.auto-kpis { margin: 14px 0 18px; }
+.auto-kpis .value { font-size: 21px; }
 .card { background: var(--surface); border: 1px solid var(--border);
         border-radius: 8px; padding: 18px 20px; margin: 0 0 20px; }
 .card h2 { font-size: 15px; font-weight: 650; margin: 0 0 2px; }
@@ -126,7 +129,27 @@ th.num, td.num { text-align: right; }
 .legend-line.realized { border-color: var(--paper-realized); border-top-style: dashed; }
 .status { display: inline-block; border: 1px solid var(--border); border-radius: 10px;
           padding: 1px 7px; font-size: 11.5px; color: var(--ink-2); }
-.status.open { border-color: var(--accent); color: var(--accent); }
+.status.open, .status.pending, .status.awaiting_fill {
+  border-color: var(--accent); color: var(--accent);
+}
+.status.realized { border-color: var(--paper-realized); color: var(--paper-realized); }
+.status.censored, .status.missed_fill, .status.unpriced { border-style: dashed; }
+.auto-charts { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(280px, 1fr);
+               gap: 20px; margin-top: 18px; }
+.auto-chart { min-width: 0; }
+.auto-chart h3 { font-size: 13px; font-weight: 620; margin: 0 0 2px; }
+.auto-chart .sub { margin-bottom: 8px; }
+.auto-badge { display: inline-block; border: 1px solid var(--accent);
+              border-radius: 10px; color: var(--accent); font-size: 11.5px;
+              padding: 1px 7px; margin-left: 6px; vertical-align: 1px; }
+.auto-badge.historical { border-color: var(--paper-realized);
+                         color: var(--paper-realized); }
+.auto-waiting { border-left: 3px solid var(--accent); padding: 10px 12px;
+                background: var(--page); margin: 14px 0 4px; }
+.auto-preview { border-style: dashed; }
+.auto-preview .tile { background: var(--page); }
+.auto-token { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+.auto-marks { font-size: 11.5px; line-height: 1.55; min-width: 150px; }
 .token-sub { color: var(--muted); font-size: 11.5px; }
 .hoverable { cursor: default; }
 #tip { position: fixed; pointer-events: none; background: var(--surface);
@@ -135,6 +158,9 @@ th.num, td.num { text-align: right; }
        box-shadow: 0 4px 14px rgba(0,0,0,0.18); display: none; z-index: 10;
        max-width: 280px; white-space: pre-line; }
 footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
+@media (max-width: 860px) {
+  .auto-charts { grid-template-columns: 1fr; }
+}
 """
 
 JS = """
@@ -892,10 +918,897 @@ def paper_section(portfolio):
   </section>"""
 
 
-def build(conn, ledger_path=paper_trades.LEDGER_PATH, now=None):
+def _auto_value(row, *keys, default=None):
+    """First present non-None value from a strategy payload mapping."""
+    if not isinstance(row, dict):
+        return default
+    for key in keys:
+        if key in row and row[key] is not None:
+            return row[key]
+    return default
+
+
+def _auto_float(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _auto_count(value):
+    number = _auto_float(value)
+    return f"{int(number):,}" if number is not None else "–"
+
+
+def _auto_entry_epoch(entry):
+    raw = _auto_value(entry, "entry_ts", "scan_ts", "ts")
+    if not raw:
+        return float("-inf")
+    try:
+        return _paper_ts(raw).timestamp()
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def _auto_book_has_data(book):
+    if not isinstance(book, dict):
+        return False
+    summary = book.get("summary") or {}
+    count = _auto_float(_auto_value(summary, "entry_count", "cohort_count", default=0))
+    return bool((count or 0) > 0 or book.get("entries"))
+
+
+def _auto_median_24h_return(book):
+    returns = []
+    for entry in (book.get("entries") or []):
+        if str(entry.get("status") or "").lower() != "realized":
+            continue
+        value = _auto_float(_auto_value(entry, "exit_return_pct", "return_pct"))
+        if value is not None:
+            returns.append(value)
+    return scoring.median(returns)
+
+
+def _auto_summary_kpis(book):
+    """Six contract KPIs for one book; callers keep live/history in separate cards."""
+    summary = book.get("summary") or {}
+    recorded_coverage = _auto_float(_auto_value(
+        summary, "recorded_price_coverage_pct", "price_coverage_pct"
+    ))
+    fresh_coverage = _auto_float(_auto_value(
+        summary,
+        "fresh_price_coverage_pct",
+        "recorded_price_coverage_pct",
+        "price_coverage_pct",
+    ))
+    win_rate = _auto_float(_auto_value(
+        summary, "win_rate_observed_pct", "win_rate_pct"
+    ))
+    win_lower = _auto_float(_auto_value(summary, "win_rate_lower_bound_pct"))
+    win_upper = _auto_float(_auto_value(summary, "win_rate_upper_bound_pct"))
+    known_pnl = _auto_float(_auto_value(summary, "known_pnl_usd"))
+    median_return = _auto_median_24h_return(book)
+    realized = _auto_count(_auto_value(summary, "realized_entries", default=0))
+    pending = _auto_count(_auto_value(summary, "pending_entries", default=0))
+    awaiting = _auto_count(_auto_value(summary, "awaiting_fill_entries", default=0))
+    missed = _auto_count(_auto_value(summary, "missed_fill_entries", default=0))
+    unpriced = _auto_count(_auto_value(summary, "unpriced_entries", default=0))
+    censored = _auto_count(_auto_value(summary, "censored_entries", default=0))
+    stale = _auto_count(_auto_value(summary, "stale_pending_entries", default=0))
+    unmarked = _auto_count(_auto_value(summary, "unmarked_pending_entries", default=0))
+
+    def tile(label, value, sub="", value_class=""):
+        cls = f" {value_class}" if value_class else ""
+        return (
+            f'<div class="tile"><div class="label">{esc(label)}</div>'
+            f'<div class="value{cls}">{value}</div>'
+            + (f'<div class="sub">{sub}</div>' if sub else "")
+            + "</div>"
+        )
+
+    pnl_class = ""
+    if known_pnl is not None:
+        pnl_class = "up" if known_pnl >= 0 else "down"
+    return "".join([
+        tile(
+            "Cohorts",
+            esc(_auto_count(_auto_value(summary, "cohort_count", default=0))),
+            f'{esc(_auto_count(_auto_value(summary, "unique_tokens", default=0)))} unique tokens',
+        ),
+        tile(
+            "Deployed",
+            esc(fmt_usd(_auto_float(_auto_value(
+                summary, "deployed_notional_usd", "total_notional_usd"
+            )))),
+            f"{pending} open · {realized} realized · {censored} censored · "
+            f"{awaiting} awaiting fill · {missed} missed fill · {unpriced} unpriced",
+        ),
+        tile(
+            "Known P&L",
+            esc(fmt_signed_usd(known_pnl)),
+            f"last-recorded open marks + realized exits · {stale} stale",
+            pnl_class,
+        ),
+        tile(
+            "Median 24h outcome",
+            fmt_pct(median_return),
+            f"{realized} realized entries",
+        ),
+        tile(
+            "Observed win rate",
+            fmt_pct(win_rate),
+            (
+                f"strict bounds {win_lower:.1f}%–{win_upper:.1f}% incl. censored"
+                if win_lower is not None and win_upper is not None
+                else "realized exits only; bounds await mature entries"
+            ),
+        ),
+        tile(
+            "Recorded-price coverage",
+            esc(
+                f"{recorded_coverage:.0f}%"
+                if recorded_coverage is not None else "–"
+            ),
+            (
+                f"fresh {fresh_coverage:.0f}% · {stale} stale · {unmarked} unmarked"
+                if fresh_coverage is not None
+                else f"{stale} stale · {unmarked} unmarked"
+            ),
+        ),
+    ])
+
+
+def auto_capture_panel(capture):
+    """Logged public-scan acceptance; deliberately not a scheduler uptime claim."""
+    capture = capture if isinstance(capture, dict) else {}
+    attempted = int(_auto_float(capture.get("attempted_scans")) or 0)
+    stamped = int(_auto_float(capture.get("stamped_scans")) or 0)
+    gated = int(_auto_float(capture.get("gated_scans")) or 0)
+    rate = _auto_float(capture.get("capture_rate_pct"))
+    if not attempted:
+        return (
+            '<div class="auto-waiting"><b>Strategy scan accounting has not started.</b><br>'
+            '<span class="note">The first public run after deployment will record '
+            'whether its complete, priceable Top-10 cohort was accepted or gated.</span>'
+            '</div>'
+        )
+    reasons = capture.get("reason_counts")
+    reason_labels = {
+        "stamped": "accepted",
+        "partial_scan": "partial scan",
+        "missing_scan_metadata": "missing scan metadata",
+        "fewer_than_10_priceable_candidates": "fewer than 10 priceable",
+    }
+    reason_text = ""
+    if isinstance(reasons, dict):
+        reason_text = " · ".join(
+            f"{int(_auto_float(count) or 0)} {reason_labels.get(str(reason), str(reason))}"
+            for reason, count in sorted(reasons.items())
+        )
+    return (
+        '<div class="kpis auto-kpis auto-capture-kpis">'
+        f'<div class="tile"><div class="label">Logged scan attempts</div>'
+        f'<div class="value">{attempted:,}</div>'
+        f'<div class="sub">{esc(str(capture.get("first_manifest_ts") or "–"))} onward</div></div>'
+        f'<div class="tile"><div class="label">Accepted cohorts</div>'
+        f'<div class="value">{stamped:,}</div>'
+        f'<div class="sub">{gated:,} gated</div></div>'
+        f'<div class="tile"><div class="label">Logged-attempt acceptance</div>'
+        f'<div class="value">{esc(f"{rate:.0f}%" if rate is not None else "–")}</div>'
+        f'<div class="sub">{esc(reason_text or "reason counts unavailable")}</div></div>'
+        '</div><p class="note">Acceptance uses only public runs that reached and '
+        'persisted the pick-log step. Scheduler misses, failures before logging, '
+        'and dropped pushes are monitored by workflow history and are not in this denominator.</p>'
+    )
+
+
+def auto_strategy_segments(book):
+    """Compact live-book audit by immutable strategy/score version."""
+    segments = book.get("segments") if isinstance(book, dict) else None
+    if not isinstance(segments, list) or not segments:
+        return ""
+    rows = []
+    entries = book.get("entries") or []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        sid = str(segment.get("strategy_id") or "?")
+        summary = segment.get("summary") if isinstance(segment.get("summary"), dict) else {}
+        returns = [
+            _auto_float(entry.get("exit_return_pct"))
+            for entry in entries
+            if entry.get("strategy_id") == sid and entry.get("status") == "realized"
+        ]
+        median_return = scoring.median([value for value in returns if value is not None])
+        rows.append(
+            '<tr>'
+            f'<td><code>{esc(sid)}</code></td>'
+            f'<td class="num">v{esc(segment.get("score_version", "?"))}</td>'
+            f'<td class="num">{esc(_auto_count(summary.get("cohort_count", 0)))}</td>'
+            f'<td class="num">{esc(_auto_count(summary.get("entry_count", 0)))}</td>'
+            f'<td class="num">{esc(_auto_count(summary.get("deployed_entries", 0)))}</td>'
+            f'<td class="num">{esc(_auto_count(summary.get("realized_entries", 0)))}</td>'
+            f'<td class="num">{esc(_auto_count(summary.get("censored_entries", 0)))}</td>'
+            f'<td class="num">{esc(_auto_count(summary.get("missed_fill_entries", 0)))}</td>'
+            f'<td class="num">{fmt_pct(median_return)}</td>'
+            '</tr>'
+        )
+    if not rows:
+        return ""
+    return (
+        '<h3 style="margin-top:16px">Live strategy versions</h3>'
+        '<p class="sub">Combined headline totals retain every immutable stamped '
+        'version; this table keeps their outcomes auditable separately.</p>'
+        '<div class="tablewrap"><table><thead><tr>'
+        '<th>Strategy</th><th class="num">Score</th><th class="num">Cohorts</th>'
+        '<th class="num">Signals</th><th class="num">Deployed</th>'
+        '<th class="num">Observed</th><th class="num">Censored</th>'
+        '<th class="num">Missed fill</th><th class="num">Median 24h</th>'
+        f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+    )
+
+
+def auto_realized_pnl_chart(points):
+    """Compact cumulative realized-P&L line for a prospective or historical book."""
+    rows = []
+    for point in points or []:
+        raw_ts = _auto_value(point, "ts", "exit_ts", "timestamp")
+        value = _auto_float(_auto_value(
+            point,
+            "cumulative_pnl_usd",
+            "cumulative_realized_pnl_usd",
+            "realized_pnl_usd",
+        ))
+        if raw_ts and value is not None:
+            try:
+                rows.append((_paper_ts(raw_ts), value, point))
+            except (TypeError, ValueError):
+                continue
+    rows.sort(key=lambda item: item[0])
+    if not rows:
+        return ('<p class="note">The realized curve appears after the first '
+                '24-hour exit is observed.</p>')
+
+    rows = _auto_sample_trend(rows)
+
+    W, H, ml, mr, mt, mb = 610, 238, 66, 14, 12, 34
+    epochs = [row[0].timestamp() for row in rows]
+    values = [row[1] for row in rows]
+    raw_lo, raw_hi = min([0.0] + values), max([0.0] + values)
+    pad = max((raw_hi - raw_lo) * 0.12, 1.0)
+    lo, hi = raw_lo - pad, raw_hi + pad
+    x0, x1 = min(epochs), max(epochs)
+
+    def sx(value):
+        if x0 == x1:
+            return (ml + W - mr) / 2
+        return ml + (value - x0) / (x1 - x0) * (W - ml - mr)
+
+    def sy(value):
+        return H - mb - (value - lo) / (hi - lo) * (H - mt - mb)
+
+    parts = [
+        f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" '
+        'aria-label="Cumulative realized 24-hour profit and loss in US dollars">',
+    ]
+    for i in range(4):
+        value = lo + (hi - lo) * i / 3
+        y = sy(value)
+        parts.append(
+            f'<line x1="{ml}" y1="{y:.1f}" x2="{W-mr}" y2="{y:.1f}" '
+            f'stroke="var(--grid)" stroke-width="1"></line>'
+            f'<text x="{ml-7}" y="{y+4:.1f}" text-anchor="end" '
+            f'fill="var(--muted)">{esc(fmt_signed_usd(value))}</text>'
+        )
+    zero_y = sy(0)
+    parts.append(
+        f'<line x1="{ml}" y1="{zero_y:.1f}" x2="{W-mr}" y2="{zero_y:.1f}" '
+        'stroke="var(--baseline)" stroke-width="1.5"></line>'
+    )
+    path = " ".join(
+        f"{sx(epoch):.1f},{sy(value):.1f}"
+        for epoch, value in zip(epochs, values)
+    )
+    parts.append(
+        f'<polyline points="{path}" fill="none" stroke="var(--accent)" '
+        'stroke-width="2.5" stroke-linecap="round" '
+        'stroke-linejoin="round"></polyline>'
+    )
+
+    tick_count = min(5, len(rows))
+    tick_indexes = sorted(set(
+        round(i * (len(rows) - 1) / max(tick_count - 1, 1))
+        for i in range(tick_count)
+    ))
+    short_span = (x1 - x0) < 2 * 86400
+    for i in tick_indexes:
+        label = rows[i][0].strftime("%b %d %H:%M" if short_span else "%b %d")
+        parts.append(
+            f'<text x="{sx(epochs[i]):.1f}" y="{H-10}" text-anchor="middle" '
+            f'fill="var(--muted)">{esc(label)}</text>'
+        )
+    for i, (dt, value, raw) in enumerate(rows):
+        period = _auto_float(_auto_value(raw, "period_pnl_usd"))
+        entries = _auto_value(raw, "cumulative_entries", "period_entries")
+        tip = f"{canonical_auto_ts(dt)}\nCumulative P&L {fmt_signed_usd(value)}"
+        if period is not None:
+            tip += f"\nPeriod P&L {fmt_signed_usd(period)}"
+        if entries is not None:
+            tip += f"\nEntries {entries}"
+        parts.append(
+            f'<circle cx="{sx(epochs[i]):.1f}" cy="{sy(value):.1f}" r="5" '
+            'fill="var(--accent)" fill-opacity="0.02" class="hoverable" '
+            f'tabindex="0" aria-label="{esc(tip)}" data-tip="{esc(tip)}"></circle>'
+        )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _auto_sample_trend(rows, max_points=180):
+    """Bound trend payload while retaining each bucket's first/min/max/last."""
+    rows = list(rows)
+    if len(rows) <= max_points:
+        return rows
+    bucket_count = max((max_points - 2) // 4, 1)
+    interior = rows[1:-1]
+    bucket_size = max(math.ceil(len(interior) / bucket_count), 1)
+    sampled = [rows[0]]
+    for start in range(0, len(interior), bucket_size):
+        bucket = interior[start:start + bucket_size]
+        candidates = {
+            0,
+            len(bucket) - 1,
+            min(range(len(bucket)), key=lambda index: bucket[index][1]),
+            max(range(len(bucket)), key=lambda index: bucket[index][1]),
+        }
+        sampled.extend(bucket[index] for index in sorted(candidates))
+    sampled.append(rows[-1])
+    return sampled[:max_points - 1] + [rows[-1]] if len(sampled) > max_points else sampled
+
+
+def canonical_auto_ts(value):
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def auto_rank_return_chart(stats):
+    """Horizontal median-return bars for entry ranks 1–10."""
+    rows = []
+    for row in stats or []:
+        rank = _auto_float(_auto_value(row, "rank"))
+        value = _auto_float(_auto_value(
+            row, "median_return_pct", "mean_return_pct", "return_pct"
+        ))
+        if rank is not None and value is not None:
+            rows.append((int(rank), value, row))
+    rows.sort(key=lambda item: item[0])
+    rows = rows[:10]
+    if not rows:
+        return ('<p class="note">Rank returns appear after the first realized '
+                '24-hour cohorts.</p>')
+
+    W, row_h, ml, mr, mt, mb = 410, 25, 46, 64, 10, 28
+    H = mt + mb + row_h * len(rows)
+    values = [row[1] for row in rows]
+    lo, hi = min([0.0] + values), max([0.0] + values)
+    if lo == hi:
+        pad = max(abs(hi) * 0.1, 1.0)
+        lo, hi = lo - pad, hi + pad
+    else:
+        pad = (hi - lo) * 0.08
+        lo, hi = lo - pad, hi + pad
+
+    def sx(value):
+        return ml + (value - lo) / (hi - lo) * (W - ml - mr)
+
+    zero_x = sx(0)
+    parts = [
+        f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" '
+        'aria-label="Median 24-hour return by entry rank">',
+        f'<line x1="{zero_x:.1f}" y1="{mt}" x2="{zero_x:.1f}" '
+        f'y2="{H-mb}" stroke="var(--baseline)" stroke-width="1.5"></line>',
+    ]
+    for i, (rank, value, raw) in enumerate(rows):
+        y = mt + i * row_h + 4
+        x = sx(value)
+        left, width = min(zero_x, x), max(abs(x - zero_x), 1.5)
+        color = "var(--up)" if value >= 0 else "var(--down)"
+        realized = _auto_value(raw, "realized", "realized_entries", default=0)
+        tip = (
+            f"Rank {rank}\nMedian 24h return {value:+.1f}%\n"
+            f"Realized entries {realized}"
+        )
+        parts.append(
+            f'<text x="{ml-8}" y="{y+12:.1f}" text-anchor="end" '
+            f'fill="var(--ink-2)">#{rank}</text>'
+            f'<rect x="{left:.1f}" y="{y:.1f}" width="{width:.1f}" height="16" '
+            f'fill="{color}" fill-opacity="0.72" class="hoverable" tabindex="0" '
+            f'aria-label="{esc(tip)}" data-tip="{esc(tip)}"></rect>'
+            f'<text x="{W-mr+7}" y="{y+12:.1f}" fill="{color}">'
+            f'{value:+.1f}%</text>'
+        )
+    parts.append(
+        f'<text x="{ml}" y="{H-8}" fill="var(--muted)">loss</text>'
+        f'<text x="{W-mr}" y="{H-8}" text-anchor="end" '
+        'fill="var(--muted)">gain</text></svg>'
+    )
+    return "".join(parts)
+
+
+def auto_score_band_chart(stats):
+    """Bounded median-return bars for the engine's score-band rows."""
+    rows = []
+    for row in stats or []:
+        band = str(_auto_value(row, "band", default="?"))
+        value = _auto_float(_auto_value(
+            row, "median_return_pct", "mean_return_pct"
+        ))
+        if value is not None:
+            rows.append((band, value, row))
+    rows = rows[:8]
+    if not rows:
+        return ('<p class="note">Score-band outcomes appear after the first '
+                'realized 24-hour cohorts.</p>')
+
+    W, row_h, ml, mr, mt, mb = 430, 27, 76, 66, 10, 28
+    H = mt + mb + row_h * len(rows)
+    values = [row[1] for row in rows]
+    lo, hi = min([0.0] + values), max([0.0] + values)
+    if lo == hi:
+        pad = max(abs(hi) * 0.1, 1.0)
+        lo, hi = lo - pad, hi + pad
+    else:
+        pad = (hi - lo) * 0.08
+        lo, hi = lo - pad, hi + pad
+
+    def sx(value):
+        return ml + (value - lo) / (hi - lo) * (W - ml - mr)
+
+    zero_x = sx(0)
+    parts = [
+        f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" '
+        'aria-label="Median 24-hour return by entry score band">',
+        '<title>Median 24-hour return by entry score band</title>',
+        f'<line x1="{zero_x:.1f}" y1="{mt}" x2="{zero_x:.1f}" '
+        f'y2="{H-mb}" stroke="var(--baseline)" stroke-width="1.5"></line>',
+    ]
+    for i, (band, value, raw) in enumerate(rows):
+        y = mt + i * row_h + 5
+        x = sx(value)
+        left, width = min(zero_x, x), max(abs(x - zero_x), 1.5)
+        color = "var(--up)" if value >= 0 else "var(--down)"
+        realized = int(_auto_float(_auto_value(raw, "realized", default=0)) or 0)
+        pending = int(_auto_float(_auto_value(raw, "pending", default=0)) or 0)
+        censored = int(_auto_float(_auto_value(raw, "censored", default=0)) or 0)
+        win_rate = _auto_float(_auto_value(raw, "win_rate_pct"))
+        rugs = int(_auto_float(_auto_value(raw, "rug_count", default=0)) or 0)
+        tip = (
+            f"Score band {band}\nMedian 24h return {value:+.1f}%\n"
+            f"Realized {realized} · pending {pending} · censored {censored}\n"
+            f"Win rate {win_rate:.1f}% · rugs {rugs}"
+            if win_rate is not None else
+            f"Score band {band}\nMedian 24h return {value:+.1f}%\n"
+            f"Realized {realized} · pending {pending} · censored {censored}\n"
+            f"Win rate unavailable · rugs {rugs}"
+        )
+        display_band = band if len(band) <= 10 else band[:9] + "…"
+        parts.append(
+            f'<text x="{ml-8}" y="{y+12:.1f}" text-anchor="end" '
+            f'fill="var(--ink-2)">{esc(display_band)}</text>'
+            f'<rect x="{left:.1f}" y="{y:.1f}" width="{width:.1f}" height="16" '
+            f'fill="{color}" fill-opacity="0.72" class="hoverable" tabindex="0" '
+            f'aria-label="{esc(tip)}" data-tip="{esc(tip)}"></rect>'
+            f'<text x="{W-mr+7}" y="{y+12:.1f}" fill="{color}">'
+            f'{value:+.1f}%</text>'
+        )
+    parts.append(
+        f'<text x="{ml}" y="{H-8}" fill="var(--muted)">loss</text>'
+        f'<text x="{W-mr}" y="{H-8}" text-anchor="end" '
+        'fill="var(--muted)">gain</text></svg>'
+    )
+    return "".join(parts)
+
+
+def auto_token_exposure_chart(entries, pending_only=False):
+    """Top-token notional shares, bounded to six tokens plus Other."""
+    grouped = {}
+    for entry in entries or []:
+        if pending_only and str(entry.get("status") or "").lower() != "pending":
+            continue
+        notional = _auto_float(_auto_value(entry, "notional_usd"))
+        if notional is None or notional <= 0:
+            continue
+        token = str(_auto_value(entry, "token", default="?"))
+        symbol = str(_auto_value(entry, "symbol", default="") or "")
+        item = grouped.setdefault(token, {
+            "token": token,
+            "symbol": symbol,
+            "notional": 0.0,
+            "entries": 0,
+        })
+        item["notional"] += notional
+        item["entries"] += 1
+
+    items = sorted(grouped.values(), key=lambda item: (
+        -item["notional"], item["token"]
+    ))
+    if not items:
+        return (
+            '<p class="note">No pending live exposure yet.</p>'
+            if pending_only else
+            '<p class="note">Token concentration appears after entries are logged.</p>'
+        )
+    total = sum(item["notional"] for item in items)
+    visible = items[:6]
+    if len(items) > 6:
+        visible.append({
+            "token": None,
+            "symbol": "Other",
+            "notional": sum(item["notional"] for item in items[6:]),
+            "entries": sum(item["entries"] for item in items[6:]),
+        })
+
+    W, row_h, ml, mr, mt, mb = 430, 27, 92, 58, 10, 27
+    H = mt + mb + row_h * len(visible)
+    aria_title = (
+        "Pending notional exposure share by token"
+        if pending_only else
+        "Historical entry notional concentration by token"
+    )
+    parts = [
+        f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" '
+        f'aria-label="{esc(aria_title)}">',
+        f"<title>{esc(aria_title)}</title>",
+    ]
+    for i, item in enumerate(visible):
+        share = item["notional"] / total * 100
+        y = mt + i * row_h + 5
+        width = max(share / 100 * (W - ml - mr), 1.5)
+        token = item["token"]
+        label = item["symbol"] or (
+            token[:7] + "…" if token and len(token) > 8 else token or "Other"
+        )
+        display_label = label if len(label) <= 12 else label[:11] + "…"
+        tip = (
+            f"{label}\nNotional {fmt_usd(item['notional'])}\n"
+            f"Share {share:.1f}%\nEntries {item['entries']}"
+        )
+        if token:
+            tip += f"\n{token}"
+        parts.append(
+            f'<text x="{ml-8}" y="{y+12:.1f}" text-anchor="end" '
+            f'fill="var(--ink-2)">{esc(display_label)}</text>'
+            f'<rect x="{ml}" y="{y}" width="{width:.1f}" height="16" '
+            'fill="var(--accent)" fill-opacity="0.72" class="hoverable" '
+            f'tabindex="0" aria-label="{esc(tip)}" data-tip="{esc(tip)}"></rect>'
+            f'<text x="{W-mr+7}" y="{y+12:.1f}" fill="var(--accent)">'
+            f'{share:.1f}%</text>'
+        )
+    source_label = "pending notional" if pending_only else "all entry notional"
+    parts.append(
+        f'<text x="{ml}" y="{H-7}" fill="var(--muted)">share of '
+        f'{esc(source_label)}</text></svg>'
+    )
+    return "".join(parts)
+
+
+def auto_entry_table(entries, limit=24):
+    """Recent strategy entries with fixed columns and a bounded row count."""
+    rows = sorted(entries or [], key=_auto_entry_epoch, reverse=True)[:limit]
+    if not rows:
+        return '<p class="note">No entries in this book yet.</p>'
+
+    body = []
+    for entry in rows:
+        status = str(_auto_value(entry, "status", default="pending")).lower()
+        fill_ts = _auto_value(entry, "entry_ts", "fill_ts")
+        decision_ts = _auto_value(entry, "decision_ts", "logged_at", "scan_ts")
+        ts = fill_ts or decision_ts
+        token = str(_auto_value(entry, "token", default="?"))
+        symbol = str(_auto_value(entry, "symbol", default="") or "")
+        token_label = symbol or (token[:8] + "…" if len(token) > 10 else token)
+        entry_id = _auto_value(entry, "entry_id", default="?")
+        pool = _auto_value(entry, "pool", default="?")
+        tip = f"{token}\nEntry {entry_id}\nPool {pool}"
+
+        entry_price = _auto_float(_auto_value(entry, "entry_price_usd"))
+        if status == "realized":
+            current_price = _auto_float(_auto_value(entry, "exit_price_usd"))
+            current_ts = _auto_value(entry, "exit_ts")
+            current_label = "24h-window exit"
+            pnl = _auto_float(_auto_value(entry, "realized_pnl_usd"))
+            return_pct = _auto_float(_auto_value(entry, "exit_return_pct"))
+            notional = _auto_float(_auto_value(entry, "notional_usd"))
+            value = (
+                notional + pnl
+                if notional is not None and pnl is not None else None
+            )
+        else:
+            current_price = _auto_float(_auto_value(entry, "mark_price_usd"))
+            current_ts = _auto_value(entry, "mark_ts")
+            current_label = "latest mark"
+            pnl = _auto_float(_auto_value(entry, "marked_pnl_usd"))
+            return_pct = _auto_float(_auto_value(entry, "mark_return_pct"))
+            value = _auto_float(_auto_value(entry, "marked_value_usd"))
+
+        if current_price is None:
+            current_html = '<span class="note">unpriced</span>'
+        else:
+            current_html = esc(fmt_token_price(current_price))
+            if current_ts:
+                current_html += (
+                    f'<br><span class="token-sub">{esc(current_label)} · '
+                    f'{esc(_compact_ts(current_ts))}</span>'
+                )
+            mark_age = _auto_float(_auto_value(entry, "mark_age_hours"))
+            if status == "pending" and mark_age is not None:
+                freshness = (
+                    f"stale · {_delay_text(mark_age * 60)} old"
+                    if entry.get("stale_mark") else
+                    f"{_delay_text(mark_age * 60)} old"
+                )
+                current_html += (
+                    f'<br><span class="token-sub">{esc(freshness)}</span>'
+                )
+        rank = _auto_value(entry, "rank", default="?")
+        score = _auto_float(_auto_value(entry, "score"))
+        version = _auto_value(entry, "score_version", default="?")
+        marks = entry.get("marks") if isinstance(entry.get("marks"), dict) else {}
+        mark_parts = []
+        for key, horizon_label in (
+            ("1h", "1h"), ("6h", "6h"), ("72h", "3d"), ("168h", "7d")
+        ):
+            mark = marks.get(key) if isinstance(marks.get(key), dict) else {}
+            mark_status = str(mark.get("status") or "pending")
+            mark_return = _auto_float(mark.get("return_pct"))
+            if mark_return is not None:
+                mark_text = f"{mark_return:+.1f}%"
+            elif mark_status == "pending":
+                mark_text = "pending"
+            elif mark_status == "awaiting_fill":
+                mark_text = "awaiting fill"
+            elif mark_status == "missed_fill":
+                mark_text = "missed fill"
+            elif mark_status == "unpriced":
+                mark_text = "unpriced"
+            else:
+                mark_text = "censored"
+            target_ts = mark.get("target_ts")
+            observed_ts = mark.get("observed_ts")
+            window_end_ts = mark.get("window_end_ts")
+            delay_hours = _auto_float(mark.get("observation_delay_hours"))
+            mark_tip = [f"{horizon_label} target"]
+            if target_ts:
+                mark_tip.append(f"target {target_ts}")
+            if observed_ts:
+                observed_note = f"observed {observed_ts}"
+                if delay_hours is not None:
+                    observed_note += f" ({delay_hours:+.1f}h from target)"
+                mark_tip.append(observed_note)
+            elif window_end_ts:
+                mark_tip.append(f"window ends {window_end_ts}")
+            mark_parts.append(
+                f'<span class="hoverable" tabindex="0" '
+                f'data-tip="{esc(chr(10).join(mark_tip))}" '
+                f'aria-label="{esc(" — ".join(mark_tip))}: {esc(mark_text)}">'
+                f'<b>{esc(horizon_label)}</b> {esc(mark_text)}</span>'
+            )
+        marks_html = " · ".join(mark_parts[:2]) + "<br>" + " · ".join(mark_parts[2:])
+        entered_html = esc(_compact_ts(ts))
+        logged_at = _auto_value(entry, "logged_at")
+        if status == "awaiting_fill":
+            entered_html += (
+                '<br><span class="token-sub">awaiting price within 2h fill window</span>'
+            )
+        elif status == "missed_fill":
+            deadline = _auto_value(entry, "fill_deadline_ts")
+            entered_html += (
+                '<br><span class="token-sub">fill window expired'
+                + (f' · {esc(_compact_ts(deadline))}' if deadline else "")
+                + '</span>'
+            )
+        elif logged_at and fill_ts:
+            try:
+                delay_minutes = max(
+                    (_paper_ts(fill_ts) - _paper_ts(logged_at)).total_seconds() / 60,
+                    0,
+                )
+                entered_html += (
+                    f'<br><span class="token-sub">filled +'
+                    f'{esc(_delay_text(delay_minutes))} after signal</span>'
+                )
+            except (TypeError, ValueError):
+                pass
+        body.append(
+            f'<tr><td>{entered_html}</td>'
+            f'<td class="num">#{esc(rank)}</td>'
+            f'<td class="auto-token hoverable" data-tip="{esc(tip)}">'
+            f'<b>{esc(token_label)}</b><br>'
+            f'<span class="token-sub">{esc(token)}</span></td>'
+            f'<td class="num">{esc(f"{score:.1f}" if score is not None else "–")}</td>'
+            f'<td class="num">v{esc(version)}</td>'
+            f'<td class="num">{esc(fmt_token_price(entry_price))}</td>'
+            f'<td class="num">{current_html}</td>'
+            f'<td class="num auto-marks">{marks_html}</td>'
+            f'<td class="num">{esc(fmt_usd(value))}</td>'
+            f'<td class="num">{pnl_html(pnl)}</td>'
+            f'<td class="num">{fmt_pct(return_pct)}</td>'
+            f'<td><span class="status {esc(status)}">'
+            f'{esc(status.replace("_", " "))}</span></td></tr>'
+        )
+    return (
+        '<div class="tablewrap"><table><thead><tr>'
+        '<th>Signal / fill</th><th class="num">Rank</th><th>Token</th>'
+        '<th class="num">Score</th><th class="num">Version</th>'
+        '<th class="num">Entry price</th><th class="num">Current / exit</th>'
+        '<th class="num">Forward marks</th>'
+        '<th class="num">Value</th><th class="num">P&amp;L</th>'
+        '<th class="num">Return</th><th>Status</th>'
+        f'</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
+    )
+
+
+def _auto_book_dashboard(book, heading, badge, historical=False):
+    summary = book.get("summary") or {}
+    rank_stats = book.get("rank_stats") or []
+    score_stats = book.get("score_stats") or []
+    trend = book.get("realized_trend") or []
+    entries = book.get("entries") or []
+    realized = _auto_count(_auto_value(summary, "realized_entries", default=0))
+    qualifier = (
+        "Retrospective, backdated scan-price replay only: ranks were finalized "
+        "later in each workflow, so these non-executable outcomes are not "
+        "directly comparable to live post-log fills and never enter live KPIs."
+        if historical else
+        "Prospective signals fill only at the first valid recorded price within "
+        "two hours after logging; later quotes cannot revive a missed fill."
+    )
+    segments_html = "" if historical else auto_strategy_segments(book)
+    return f"""
+    <div class="card{" auto-preview" if historical else ""}">
+      <h2>{esc(heading)}<span class="auto-badge{" historical" if historical else ""}">
+        {esc(badge)}</span></h2>
+      <p class="sub">{esc(qualifier)}</p>
+      <div class="kpis auto-kpis">{_auto_summary_kpis(book)}</div>
+      {segments_html}
+      <div class="auto-charts">
+        <div class="auto-chart">
+          <h3>Cumulative realized 24h P&amp;L</h3>
+          <p class="sub">Closed 24-hour cohorts only · {esc(realized)} realized entries</p>
+          {auto_realized_pnl_chart(trend)}
+        </div>
+        <div class="auto-chart">
+          <h3>Median 24h return by entry rank</h3>
+          <p class="sub">Ranks remain separate; pending and censored entries are excluded</p>
+          {auto_rank_return_chart(rank_stats)}
+        </div>
+      </div>
+      <div class="auto-charts">
+        <div class="auto-chart">
+          <h3>Median 24h return by score band</h3>
+          <p class="sub">Realized exits in this {esc("historical" if historical else "live")} book
+            only · pending and censored entries are excluded</p>
+          {auto_score_band_chart(score_stats)}
+        </div>
+        <div class="auto-chart">
+          <h3>{esc("Historical entry concentration" if historical else "Pending exposure by token")}</h3>
+          <p class="sub">{
+            esc("All historical entry notionals; persistence-weighted, not current exposure"
+                if historical else
+                "Pending prospective notionals only; realized and censored entries are excluded")
+          }</p>
+          {auto_token_exposure_chart(entries, pending_only=not historical)}
+        </div>
+      </div>
+      <h2 style="margin-top:18px">Recent {esc("historical" if historical else "live")} entries</h2>
+      <p class="sub">Latest {min(len(entries), 12 if historical else 24)} of
+        {len(entries):,} entries · exact token address appears below the symbol</p>
+      {auto_entry_table(entries, limit=12 if historical else 24)}
+    </div>"""
+
+
+def auto_strategy_section(payload):
+    """Render prospective and historical Top-10 books without blending metrics."""
+    prospective = payload.get("prospective") or {}
+    historical = payload.get("historical") or {}
+    version = _auto_value(payload, "score_version", default="?")
+    notional = _auto_float(_auto_value(payload, "notional_usd"))
+    hold = _auto_float(_auto_value(payload, "hold_hours"))
+    fill_window = _auto_float(_auto_value(payload, "fill_window_hours"))
+    outcome_tolerance = _auto_float(_auto_value(payload, "outcome_tolerance_hours"))
+    strategy_id = _auto_value(payload, "strategy_id", default="top-10")
+    capture = payload.get("capture") if isinstance(payload.get("capture"), dict) else {}
+    as_of = _auto_value(payload, "as_of", default="?")
+    metadata = [
+        f"current strategy {strategy_id}",
+        f"current score v{version}",
+        f"{fmt_usd(notional)} per ranked entry" if notional is not None else None,
+        f"{fill_window:g}h fill window" if fill_window is not None else None,
+        f"{hold:g}h exit target" if hold is not None else None,
+        (
+            f"+{outcome_tolerance:g}h observation tolerance"
+            if outcome_tolerance is not None else None
+        ),
+        f"as of {as_of}",
+    ]
+    metadata_text = " · ".join(str(item) for item in metadata if item)
+
+    parts = [
+        '<section id="automatic-top10-strategy">',
+        '<div class="card">',
+        '<h2>Automatic Top-10 strategy'
+        '<span class="auto-badge">live prospective</span></h2>',
+        f'<p class="sub">{esc(metadata_text)}</p>',
+        '<p class="note">Method: the 24h target uses the first recorded quote '
+        'from target through +6h and is censored if none arrives. Live signals '
+        'have a two-hour post-log fill window. The historical preview instead '
+        'replays backdated scan quotes, so it is non-executable and not directly '
+        'comparable to live fills. All values are gross of costs.</p>',
+        auto_capture_panel(capture),
+    ]
+    live_has_data = _auto_book_has_data(prospective)
+    if live_has_data:
+        parts.append(
+            '<p class="note">Each scan creates separate ranked paper entries. '
+            'They remain separate from the manual paper-trade ledger. The scan '
+            'quote is provenance only: a prospective signal fills at the first '
+            'valid recorded pool-side price within two hours after ranking, or '
+            'expires as a missed fill. Its 24-hour target starts at the fill; the '
+            'exit is the first recorded quote from that target through +6h, then '
+            'is censored if absent. Forward-mark tooltips show their actual '
+            'observation time and delay. P&amp;L uses last-recorded marks and '
+            'labels stale coverage.'
+            '</p></div>'
+        )
+        strategy_ids = prospective.get("strategy_ids") or []
+        combined = len(strategy_ids) > 1
+        parts.append(_auto_book_dashboard(
+            prospective,
+            "Combined live prospective book" if combined else "Live prospective book",
+            f"{len(strategy_ids)} versions" if combined else "live only",
+            historical=False,
+        ))
+    else:
+        attempted = int(_auto_float(capture.get("attempted_scans")) or 0)
+        waiting_title = (
+            "No public scan has passed the strategy gate yet."
+            if attempted else
+            "Waiting for the first public scan."
+        )
+        parts.append(
+            f'<div class="auto-waiting"><b>{esc(waiting_title)}</b><br>'
+            '<span class="note">Only a complete, priceable Top-10 scan creates '
+            'live entries; gated attempts remain visible above and historical '
+            'rows are never inserted into live KPIs.</span>'
+            '</div></div>'
+        )
+
+    # During rollout the live book is intentionally empty. Keep the historical
+    # preview visible even if its own source is temporarily empty, so readers
+    # never mistake a missing card for live/historical metric blending.
+    if _auto_book_has_data(historical) or not live_has_data:
+        parts.append(_auto_book_dashboard(
+            historical,
+            f"Historical score-v{version} preview",
+            "retrospective",
+            historical=True,
+        ))
+    parts.append("</section>")
+    return "".join(parts)
+
+
+def build(
+    conn,
+    ledger_path=paper_trades.LEDGER_PATH,
+    now=None,
+    picks_dir=auto_paper.PICKS_DIR,
+):
     now = now or datetime.now(timezone.utc)
     latest = db.latest_rows(conn)
     portfolio = paper_trades.build_portfolio(conn, ledger_path=ledger_path, now=now)
+    automatic_strategy = auto_paper.build_strategy(
+        conn, picks_dir=picks_dir, now=now
+    )
     n_tokens = conn.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]
     n_scans = conn.execute("SELECT COUNT(DISTINCT ts) FROM snapshots").fetchone()[0]
     first_ts, last_ts = conn.execute("SELECT MIN(ts), MAX(ts) FROM snapshots").fetchone()
@@ -940,6 +1853,7 @@ def build(conn, ledger_path=paper_trades.LEDGER_PATH, now=None):
   </header>
   <div class="kpis">{kpis}</div>
   {paper_section(portfolio)}
+  {auto_strategy_section(automatic_strategy)}
   {pulse_section(conn)}
   {collection_section(conn)}
   {picks_section(latest, now)}
@@ -968,6 +1882,8 @@ def main():
     ap.add_argument("--out", default="report.html")
     ap.add_argument("--paper-ledger", default=str(paper_trades.LEDGER_PATH),
                     help="paper-trade JSONL path (default: data/paper_trades.jsonl)")
+    ap.add_argument("--auto-picks", default=str(auto_paper.PICKS_DIR),
+                    help="automatic-strategy pick-log directory")
     ap.add_argument("--fragment", action="store_true",
                     help="emit body content only (no <!doctype>/<html> wrapper)")
     args = ap.parse_args()
@@ -976,7 +1892,11 @@ def main():
         raise SystemExit("no data/scanner.db — run scanner.py or build_db.py first")
     conn = db.connect()
     try:
-        inner = build(conn, ledger_path=args.paper_ledger)
+        inner = build(
+            conn,
+            ledger_path=args.paper_ledger,
+            picks_dir=args.auto_picks,
+        )
     finally:
         conn.close()
 

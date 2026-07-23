@@ -12,6 +12,7 @@ on:
     - cron: "23 * * * *"
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -79,15 +80,29 @@ jobs:
           python3 build_db.py
           python3 onchain.py --max 40
 
-      - name: Log picks and regenerate HTML dashboard
+      # Persist the immutable strategy signal even if presentation rendering
+      # later regresses. The final step still marks the workflow failed so a
+      # stale dashboard cannot go unnoticed.
+      - name: Log picks
+        run: python3 log_picks.py
+
+      - name: Regenerate HTML dashboard
+        id: report
+        continue-on-error: true
+        run: python3 report_html.py
+
+      - name: Warn when dashboard regeneration failed
+        if: steps.report.outcome == 'failure'
         run: |
-          python3 log_picks.py
-          python3 report_html.py
+          echo "::warning::dashboard regeneration failed; scanner data and picks will still be persisted"
 
       # with a DASHBOARD_PASSWORD secret set, the dashboard is committed only
       # as an AES-encrypted page for GitHub Pages (docs/index.html) and the
       # plaintext report.html is untracked — for use with a PUBLIC repository
       - name: Encrypt dashboard for GitHub Pages
+        id: encrypt
+        if: steps.report.outcome == 'success'
+        continue-on-error: true
         env:
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
         run: |
@@ -97,16 +112,22 @@ jobs:
           fi
 
       - name: Commit snapshot
+        if: ${{ always() && !cancelled() }}
         env:
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+          GH_TOKEN: ${{ github.token }}
+          REPORT_OK: ${{ steps.report.outcome }}
+          ENCRYPT_OK: ${{ steps.encrypt.outcome }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$DASHBOARD_PASSWORD" ]; then
-            git rm --cached -q report.html 2>/dev/null || true
-            git add docs/index.html
-          else
-            git add report.html
+          if [ "$REPORT_OK" = "success" ] && [ "$ENCRYPT_OK" = "success" ]; then
+            if [ -n "$DASHBOARD_PASSWORD" ]; then
+              git rm --cached -q report.html 2>/dev/null || true
+              git add docs/index.html
+            else
+              git add report.html
+            fi
           fi
           if [ -f .public ]; then
             # public deployment: commit the data tree encrypted, never raw
@@ -122,15 +143,32 @@ jobs:
           fi
           git commit -m "scan: $(date -u +'%Y-%m-%dT%H:%MZ')"
           # another push may have landed meanwhile — rebase (JSONL files
-          # union-merge via .gitattributes) and retry; if the rebase still
-          # conflicts (regenerated report), drop this cycle rather than fail
+          # union-merge via .gitattributes) and retry. A remaining conflict
+          # fails visibly and dispatches a clean serialized replacement run.
           for i in 1 2 3; do
             git push && exit 0
             git fetch origin ${{ github.ref_name }}
             git rebase origin/${{ github.ref_name }} || {
               git rebase --abort
-              echo "::warning::unresolvable push race — this scan cycle's data was dropped"
-              exit 0
+              echo "::error::unresolvable push race — queueing a clean retry"
+              gh workflow run scan.yml --ref "${GITHUB_REF_NAME}" || \
+                echo "::warning::could not queue the retry automatically"
+              exit 1
             }
           done
+          echo "::error::push retries exhausted — queueing a clean retry"
+          gh workflow run scan.yml --ref "${GITHUB_REF_NAME}" || \
+            echo "::warning::could not queue the retry automatically"
+          exit 1
+
+      - name: Surface dashboard regeneration failure
+        if: always() && steps.report.outcome == 'failure'
+        run: |
+          echo "::error::dashboard regeneration failed; see Commit snapshot for persistence status"
+          exit 1
+
+      - name: Surface dashboard encryption failure
+        if: always() && steps.encrypt.outcome == 'failure'
+        run: |
+          echo "::error::dashboard encryption failed; see Commit snapshot for persistence status"
           exit 1
